@@ -4,7 +4,10 @@ set -eu
 
 usage() {
     echo "Usage: $0 [--dry-run] [REF]"
-    echo "Update Luau from mlua-rs/luau (default ref: master)."
+    echo "Update Luau from simonklee/luau (default ref: master): the sources, and the"
+    echo "version's build metadata in Cargo.toml (luau<release>.sk.<commit>)."
+    echo "REF is a branch, a tag or a full commit id. LUAU_REPOSITORY overrides the"
+    echo "repository (a URL or a local path)."
 }
 
 die() {
@@ -29,13 +32,13 @@ for arg in "$@"; do
 done
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-repository=https://github.com/mlua-rs/luau.git
+repository=${LUAU_REPOSITORY:-https://github.com/simonklee/luau.git}
 components="Ast Bytecode CodeGen Common Compiler Config Inliner Require VM"
 set --
 for component in $components; do
     set -- "$@" "luau/$component"
 done
-changes=$(git status --porcelain --untracked-files=all --ignored -- "$@")
+changes=$(git status --porcelain --untracked-files=all --ignored -- Cargo.toml "$@")
 [ -z "$changes" ] ||
     die "commit or stash changes and move ignored files out of vendored components first"
 
@@ -66,9 +69,11 @@ echo "Fetching $repository ($ref)..."
 git init --quiet "$temporary/source"
 git -C "$temporary/source" fetch --quiet --depth=100 "$repository" "$ref"
 commit=$(git -C "$temporary/source" rev-parse FETCH_HEAD)
-# The fork has no release tags. Include fixes after the latest release sync.
-git -C "$temporary/source" log --first-parent --format=%s "$commit" > "$temporary/history"
-version=$(sed -n 's|^Sync to upstream/release/\([0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$|\1|p' "$temporary/history" | sed -n '1p')
+short=$(git -C "$temporary/source" rev-parse --short=8 "$commit")
+# The fork has no release tags. Upstream syncs are merged, so take the latest
+# release sync anywhere in the fetched history.
+git -C "$temporary/source" log --format=%s "$commit" > "$temporary/history"
+version=$(sed -n 's|^Sync to upstream/release/\([0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$|\1|p' "$temporary/history" | sort -n | sed -n '$p')
 [ -n "$version" ] || die "no Luau release sync found in the fetched 100 commits"
 git -C "$temporary/source" checkout --quiet "$commit" -- $components
 for component in $components; do
@@ -78,7 +83,12 @@ for component in $components; do
     done
 done
 
-echo "Luau 0.$version at $commit"
+current=$(sed -n 's|^version = "\([0-9.]*\)+.*"$|\1|p' Cargo.toml)
+[ -n "$current" ] || die "no version in Cargo.toml"
+crate_version="$current+luau$version.sk.$short"
+echo "Luau 0.$version at $commit: luau0-src $crate_version"
+grep -q "^version = \"$current+luau$version[.\"]" Cargo.toml ||
+    echo "note: the Luau release changed; set the crate's major.minor to match mlua-sys" >&2
 if [ "$dry_run" = true ]; then
     echo "Dry run: sources were not changed."
     exit 0
@@ -95,5 +105,7 @@ for component in $components; do
     cp -R "$temporary/source/$component" "luau/$component"
 done
 replaced=
+sed "s|^version = \"[^\"]*\"$|version = \"$crate_version\"|" Cargo.toml > "$temporary/Cargo.toml"
+mv "$temporary/Cargo.toml" Cargo.toml
 
 echo "Done."
