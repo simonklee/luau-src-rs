@@ -433,7 +433,9 @@ impl Artifacts {
 
     pub fn version(&self) -> Option<String> {
         let pkg_version = env!("CARGO_PKG_VERSION");
-        let (_, luau_version) = pkg_version.split_once("+luau")?;
+        let (_, build) = pkg_version.split_once("+luau")?;
+        // The build metadata may name more than the release (e.g. `luau747.sk.aa9d8201`)
+        let luau_version = build.split('.').next()?;
         Some(format!("0.{luau_version}"))
     }
 }
