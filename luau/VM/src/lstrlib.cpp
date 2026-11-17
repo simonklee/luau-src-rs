@@ -8,8 +8,13 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringSplit, false)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, false)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLinearStringSearch, true)
 
 // macro to `unsign' a character
 #define uchar(c) ((unsigned char)(c))
@@ -578,8 +583,307 @@ init: // using goto's to optimize tail recursion
     return s;
 }
 
+// Plain substring search for string.find, string.split and string.gsub. It first looks for the needle's first byte with
+// memchr and compares the rest, which is fast for common inputs but O(n * m) in the worst case. It counts its work, and
+// once that exceeds the bytes it has moved through the haystack (plus a fixed slack), the two-way algorithm (Crochemore
+// and Perrin, 1991) finishes the search in O(n + m) time and O(1) extra memory. So no input makes a search take longer
+// than a few passes over the haystack.
+struct StringSearch
+{
+    const unsigned char* needle;
+    size_t len;
+    const char* origin; // where the search started; string.split and string.gsub search the rest again after each match
+    size_t work;        // the simple search's work since then: bytes compared, and a fixed cost per memchr call
+
+    // two-way state, set up the first time the simple search hands over
+    bool twoway;
+    bool periodic; // the right part's period is a period of the whole needle, so a shift by it keeps a matched prefix
+    size_t crit;   // the needle is split at a critical factorization into needle[0, crit) and needle[crit, len)
+    size_t period;
+};
+
+// the simple search counts each memchr call as this many bytes of work, so it keeps going while candidates are about 6
+// or more bytes apart, where it is faster than two-way
+const size_t kStringSearchCallCost = 4;
+
+// work the simple search may do before it compares its work to its progress, so that a few close candidates at the
+// start don't hand a common search over to two-way
+const size_t kStringSearchSlack = 256;
+
+// after a memchr call in two-way that skipped fewer positions than this, the next this many positions are filtered inline
+const size_t kStringSearchScan = 64;
+
+// string.split and string.gsub check this many positions inline before they search for the next match
+const size_t kStringSearchClose = 16;
+
+// every this many bytes (or the needle's length), two-way skips to the next occurrence of the needle's first byte
+const size_t kStringSearchStretch = 4096;
+
+static LUAU_FORCEINLINE uint32_t strsearch_load4(const unsigned char* p)
+{
+    uint32_t r;
+    memcpy(&r, p, 4);
+    return r;
+}
+
+// returns the index of the first non-zero byte of a non-zero word made from words loaded with strsearch_load4
+static LUAU_FORCEINLINE size_t strsearch_firstbyte(uint32_t d)
+{
+#if defined(LUAU_BIG_ENDIAN)
+    return __builtin_clz(d) / 8;
+#elif defined(_MSC_VER)
+    unsigned long r;
+    _BitScanForward(&r, d);
+    return r / 8;
+#else
+    return __builtin_ctz(d) / 8;
+#endif
+}
+
+// returns the first i in [i, m) where x[i] != y[i], or m; it compares 4 bytes at a time, so that on random data the
+// comparisons don't each end in a mispredicted branch
+static LUAU_FORCEINLINE size_t strsearch_mismatch(const unsigned char* x, const unsigned char* y, size_t i, size_t m)
+{
+    for (; i + 4 <= m; i += 4)
+    {
+        uint32_t a = strsearch_load4(x + i);
+        uint32_t b = strsearch_load4(y + i);
+        if (a != b)
+            return i + strsearch_firstbyte(a ^ b);
+    }
+
+    while (i < m && x[i] == y[i])
+        i++;
+    return i;
+}
+
+// returns the start of the maximal suffix of x under the byte order (or its reverse), and that suffix's period
+static size_t maxsuffix(const unsigned char* x, size_t m, size_t* period, bool reverse)
+{
+    size_t s = 0, j = 1, k = 1, p = 1;
+    while (j + k <= m)
+    {
+        unsigned char a = x[j + k - 1];
+        unsigned char b = x[s + k - 1];
+        if (a == b)
+        {
+            if (k == p)
+            {
+                j += p;
+                k = 1;
+            }
+            else
+            {
+                k++;
+            }
+        }
+        else if ((a < b) != reverse)
+        {
+            j += k;
+            k = 1;
+            p = j - s;
+        }
+        else
+        {
+            s = j;
+            j = s + 1;
+            k = p = 1;
+        }
+    }
+    *period = p;
+    return s;
+}
+
+static void strsearch_init(StringSearch* ss, const char* needle, size_t len, const char* origin)
+{
+    ss->needle = (const unsigned char*)needle;
+    ss->len = len;
+    ss->origin = origin;
+    ss->work = 0;
+    ss->twoway = false;
+}
+
+// finishes a search from y + j with two-way; it is called once the simple search would do more work than it saves
+static LUAU_NOINLINE const char* strsearch_twoway(StringSearch* ss, const char* s, size_t l, size_t j)
+{
+    const unsigned char* x = ss->needle;
+    const unsigned char* y = (const unsigned char*)s;
+    size_t m = ss->len;
+
+    if (!ss->twoway)
+    {
+        size_t p, q;
+        size_t i = maxsuffix(x, m, &p, false);
+        size_t k = maxsuffix(x, m, &q, true);
+        ss->crit = i > k ? i : k;
+        ss->period = i > k ? p : q;
+        ss->periodic = memcmp(x, x + ss->period, ss->crit) == 0;
+
+        if (!ss->periodic)
+            ss->period = (ss->crit > m - ss->crit ? ss->crit : m - ss->crit) + 1;
+
+        ss->twoway = true;
+    }
+
+    size_t crit = ss->crit;
+    size_t matched = 0; // in the periodic case, the length of the needle's prefix known to match at y + j
+    size_t scanto = j;  // memchr isn't called for positions before this
+    size_t stretch = j + (m > kStringSearchStretch ? m : kStringSearchStretch);
+
+    // the filter below compares the needle's bytes in the window's [base, base + 4), which hold the start of the right
+    // part (where a periodic haystack stops matching a needle), and all of a needle of up to 4 bytes
+    size_t base = m <= 4 ? 0 : crit < m - 4 ? crit : m - 4;
+    unsigned char xb[4] = {}, mb[4] = {};
+    for (size_t k = 0; k < 4 && base + k < m; k++)
+    {
+        xb[k] = x[base + k];
+        mb[k] = 0xff;
+    }
+    uint32_t xbase = strsearch_load4(xb), mask = strsearch_load4(mb);
+    size_t wordend = l >= base + 4 ? l - base - 3 : 0; // positions where the filter's word is in the haystack
+
+    while (j <= l - m)
+    {
+        // a match starts with the needle's first byte, and where that byte is rare and the right part's first byte is
+        // common, memchr for it skips much farther than two-way
+        if (matched == 0 && j >= stretch)
+        {
+            const unsigned char* next = (const unsigned char*)memchr(y + j, x[0], l - m - j + 1);
+            if (!next)
+                return NULL;
+
+            j = next - y;
+            stretch = j + (m > kStringSearchStretch ? m : kStringSearchStretch);
+        }
+
+        // positions where the first byte of the right part differs fail at once and shift by one, so memchr can skip
+        // them; where that byte is common, the next positions are filtered inline instead
+        if (matched == 0 && j < scanto)
+        {
+            size_t end = scanto < l - m + 1 ? scanto : l - m + 1;
+            size_t wend = end < wordend ? end : wordend;
+
+            // the positions are independent, so this loop runs several at once, which beats any shift that has to wait
+            // for the comparison before it
+            while (j < wend && ((strsearch_load4(y + j + base) ^ xbase) & mask) != 0)
+                j++;
+
+            if (j < wend && m <= 4)
+                return s + j;
+            if (j >= end)
+                continue;
+
+            // the full comparison below takes a position the filter couldn't decide, or one where its word doesn't fit
+        }
+        else if (matched == 0 && x[crit] != y[j + crit])
+        {
+            const unsigned char* next = (const unsigned char*)memchr(y + j + crit, x[crit], l - m - j + 1);
+            if (!next)
+                return NULL;
+
+            size_t k = next - y - crit;
+            if (k - j < kStringSearchScan)
+                scanto = k + kStringSearchScan;
+            j = k;
+        }
+        else if (matched == 0)
+        {
+            // a shift landed on the first byte of the right part, so that byte is common
+            scanto = j + kStringSearchScan;
+        }
+
+        // match the right part from left to right
+        size_t i = strsearch_mismatch(x, y + j, crit > matched ? crit : matched, m);
+
+        if (i < m)
+        {
+            j += i - crit + 1;
+            matched = 0;
+            continue;
+        }
+
+        // match the left part from right to left
+        i = crit;
+        while (i > matched && x[i - 1] == y[j + i - 1])
+            i--;
+
+        if (i <= matched)
+            return s + j;
+
+        j += ss->period;
+        matched = ss->periodic ? m - ss->period : 0;
+    }
+
+    return NULL;
+}
+
+static LUAU_FORCEINLINE const char* strsearch_find(StringSearch* ss, const char* s, size_t l)
+{
+    const unsigned char* x = ss->needle;
+    const unsigned char* y = (const unsigned char*)s;
+    size_t m = ss->len;
+
+    if (m == 0)
+        return s; // empty strings are everywhere
+    if (m > l)
+        return NULL;
+    if (m == 1)
+        return x[0] == y[0] ? s : (const char*)memchr(s + 1, x[0], l - 1); // adjacent matches don't need a memchr call
+    // string.split and string.gsub search again after each match; where matches are close, the next one is found inline,
+    // as their own loops find it, without a memchr call
+    size_t close = s == ss->origin ? 1 : (l - m < kStringSearchClose ? l - m + 1 : kStringSearchClose);
+    size_t j = 0;
+    for (; j < close; j++)
+    {
+        if (x[0] == y[j] && x[m - 1] == y[j + m - 1] && memcmp(x, y + j, m) == 0)
+            return s + j;
+    }
+    if (j > l - m)
+        return NULL;
+
+    for (;;)
+    {
+        // a candidate right after the last one is checked inline, so a run of them doesn't make a memchr call each
+        if (x[0] != y[j])
+        {
+            const unsigned char* next = (const unsigned char*)memchr(y + j, x[0], l - m - j + 1);
+            if (!next)
+                return NULL;
+            j = next - y;
+            ss->work += kStringSearchCallCost;
+        }
+
+        // most candidates fail at the second byte, and most of the rest at the last; memcmp compares the others but
+        // doesn't say where it stopped, so its failure counts as m bytes of work
+        size_t i = 2;
+        if (x[1] == y[j + 1])
+        {
+            if (x[m - 1] != y[j + m - 1])
+                i = 3;
+            else if (memcmp(x + 2, y + j + 2, m - 2) == 0)
+                return s + j;
+            else
+                i = m;
+        }
+
+        if (++j > l - m)
+            return NULL;
+
+        ss->work += i;
+        if (ss->work > size_t(s + j - ss->origin) + m + kStringSearchSlack)
+            return strsearch_twoway(ss, s, l, j);
+    }
+}
+
 static const char* lmemfind(const char* s1, size_t l1, const char* s2, size_t l2)
 {
+    if (DFFlag::LuauLinearStringSearch)
+    {
+        StringSearch ss;
+        strsearch_init(&ss, s2, l2, s1);
+        return strsearch_find(&ss, s1, l1);
+    }
+
     if (l2 == 0)
         return s1; // empty strings are everywhere
     else if (l2 > l1)
@@ -914,9 +1218,14 @@ static int str_gsub(lua_State* L)
         const char* repl = NULL;
         size_t repll = 0;
 
+        // findliteral finds a single byte with memchr, which is already linear
+        bool linear = DFFlag::LuauLinearStringSearch && lp > 1;
+        StringSearch ss;
+        strsearch_init(&ss, p, lp, src);
+
         while (n < max_s)
         {
-            const char* e = findliteral(src, ms.src_end, p, lp);
+            const char* e = linear ? strsearch_find(&ss, src, ms.src_end - src) : findliteral(src, ms.src_end, p, lp);
             if (!e)
                 break;
 
@@ -1221,7 +1530,18 @@ static int str_split(lua_State* L)
         {
             lua_createtable(L, 0, 0);
 
-            if (needleLen <= haystackLen)
+            if (DFFlag::LuauLinearStringSearch)
+            {
+                StringSearch ss;
+                strsearch_init(&ss, needle, needleLen, haystack);
+
+                for (const char* found; (found = strsearch_find(&ss, spanStart, end - spanStart)) != NULL; spanStart = found + needleLen)
+                {
+                    lua_pushlstring(L, spanStart, found - spanStart);
+                    lua_rawseti(L, -2, ++numMatches);
+                }
+            }
+            else if (needleLen <= haystackLen)
             {
                 // Don't iterate the last needleLen - 1 bytes of the string - they are
                 // impossible to be splits and would let us memcmp past the end of the
@@ -1262,24 +1582,39 @@ static int str_split(lua_State* L)
         if (needleLen == 0)
             begin++;
 
-        // Don't iterate the last needleLen - 1 bytes of the string - they are
-        // impossible to be splits and would let us memcmp past the end of the
-        // buffer.
-        for (const char* iter = begin; iter <= end - needleLen; iter++)
+        if (DFFlag::LuauLinearStringSearch && needleLen > 0)
         {
-            // Use of memcmp here instead of strncmp is so that we allow embedded
-            // nulls to be used in either of the haystack or the needle strings.
-            // Most Lua string APIs allow embedded nulls, and this should be no
-            // exception.
-            if (memcmp(iter, needle, needleLen) == 0)
+            StringSearch ss;
+            strsearch_init(&ss, needle, needleLen, haystack);
+
+            for (const char* found; (found = strsearch_find(&ss, spanStart, end - spanStart)) != NULL; spanStart = found + needleLen)
             {
                 lua_pushinteger(L, ++numMatches);
-                lua_pushlstring(L, spanStart, iter - spanStart);
+                lua_pushlstring(L, spanStart, found - spanStart);
                 lua_settable(L, -3);
+            }
+        }
+        else
+        {
+            // Don't iterate the last needleLen - 1 bytes of the string - they are
+            // impossible to be splits and would let us memcmp past the end of the
+            // buffer.
+            for (const char* iter = begin; iter <= end - needleLen; iter++)
+            {
+                // Use of memcmp here instead of strncmp is so that we allow embedded
+                // nulls to be used in either of the haystack or the needle strings.
+                // Most Lua string APIs allow embedded nulls, and this should be no
+                // exception.
+                if (memcmp(iter, needle, needleLen) == 0)
+                {
+                    lua_pushinteger(L, ++numMatches);
+                    lua_pushlstring(L, spanStart, iter - spanStart);
+                    lua_settable(L, -3);
 
-                spanStart = iter + needleLen;
-                if (needleLen > 0)
-                    iter += needleLen - 1;
+                    spanStart = iter + needleLen;
+                    if (needleLen > 0)
+                        iter += needleLen - 1;
+                }
             }
         }
 
