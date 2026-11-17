@@ -345,13 +345,30 @@ impl Build {
                 .clone(),
         ));
 
-        // One thread per library: cc's parallel jobs share one pool (cargo's jobserver, or
-        // `NUM_JOBS`) across threads, so all objects are compiled in one parallel pass.
-        std::thread::scope(|scope| {
-            for (name, build) in &builds {
-                scope.spawn(move || build.compile(name));
-            }
+        // Detect the compiler and probe the conditional flags once, before the threads start.
+        // The answers are cached in state the clones share, so the threads run no probes.
+        if let Err(err) = config.out_dir(&build_dir).try_get_compiler() {
+            panic!("failed to detect the C++ compiler: {err}");
+        }
+
+        // One thread per library compiles its objects: cc's jobs share one pool (cargo's
+        // jobserver, or `NUM_JOBS`) across threads, so all objects are compiled in one parallel
+        // pass. Every thread is joined, so all job tokens are returned, before an error is raised.
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (builds.iter())
+                .map(|(_, build)| scope.spawn(move || build.try_compile_intermediates()))
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
         });
+
+        // Then archive each library, one at a time, in a stable order.
+        for ((name, _), result) in builds.iter().zip(results) {
+            if let Err(err) =
+                result.and_then(|objects| config.clone().objects(objects).try_compile(name))
+            {
+                panic!("failed to build {name}: {err}");
+            }
+        }
 
         let mut artifacts = Artifacts {
             lib_dir: build_dir,
