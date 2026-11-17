@@ -43,6 +43,8 @@ changes=$(git status --porcelain --untracked-files=all --ignored -- Cargo.toml "
     die "commit or stash changes and move ignored files out of vendored components first"
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/luau-update.XXXXXX")
+# The new manifest is written next to the old one, so that installing it is a rename.
+staged=.Cargo.toml.update
 replaced=
 cleanup() {
     status=$?
@@ -57,6 +59,7 @@ cleanup() {
                 }
         done
     fi
+    rm -f "$staged"
     rm -rf "$temporary"
     exit "$status"
 }
@@ -68,7 +71,7 @@ trap 'exit 143' TERM
 echo "Fetching $repository ($ref)..."
 git init --quiet "$temporary/source"
 git -C "$temporary/source" fetch --quiet --depth=100 "$repository" "$ref"
-commit=$(git -C "$temporary/source" rev-parse FETCH_HEAD)
+commit=$(git -C "$temporary/source" rev-parse --verify 'FETCH_HEAD^{commit}')
 short=$(git -C "$temporary/source" rev-parse --short=8 "$commit")
 # The fork has no release tags. Upstream syncs are merged, so take the latest
 # release sync anywhere in the fetched history.
@@ -95,6 +98,7 @@ if [ "$dry_run" = true ]; then
 fi
 
 # Stage and validate before replacing anything; preserve Custom and local files.
+sed "s|^version = \"[^\"]*\"$|version = \"$crate_version\"|" Cargo.toml > "$staged"
 mkdir "$temporary/backup"
 for component in $components; do
     cp -R "luau/$component" "$temporary/backup/$component"
@@ -104,8 +108,9 @@ for component in $components; do
     rm -rf "luau/$component"
     cp -R "$temporary/source/$component" "luau/$component"
 done
+# The sources and the manifest change together: a failed rename restores the sources.
+trap '' HUP INT TERM
+mv -f "$staged" Cargo.toml
 replaced=
-sed "s|^version = \"[^\"]*\"$|version = \"$crate_version\"|" Cargo.toml > "$temporary/Cargo.toml"
-mv "$temporary/Cargo.toml" Cargo.toml
 
 echo "Done."
