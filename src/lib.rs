@@ -347,6 +347,8 @@ impl Build {
 
         // Detect the compiler and probe the conditional flags once, before the threads start.
         // The answers are cached in state the clones share, so the threads run no probes.
+        // The probes write into the build directory, which older cc versions don't create.
+        fs::create_dir_all(&build_dir).unwrap();
         if let Err(err) = config.out_dir(&build_dir).try_get_compiler() {
             panic!("failed to detect the C++ compiler: {err}");
         }
