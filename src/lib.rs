@@ -180,7 +180,8 @@ impl Build {
         config
             .clone()
             .include(&ast_include_dir)
-            .add_files_by_ext_sorted(&ast_source_dir, "cpp")
+            // The pretty printer is not used by the compiler or the VM
+            .add_files_by_ext_sorted_except(&ast_source_dir, "cpp", &["PrettyPrinter.cpp"])
             .out_dir(&build_dir)
             .compile(ast_lib_name);
 
@@ -217,28 +218,36 @@ impl Build {
         let bytecode_lib_name = "luaubytecode";
         let bytecode_source_dir = luau_source_dir.join("Bytecode").join("src");
         let bytecode_include_dir = luau_source_dir.join("Bytecode").join("include");
+        // The bytecode graph and Sccp are used only by the inliner (codegen)
+        let bytecode_skip: &[&str] = if self.enable_codegen {
+            &[]
+        } else {
+            &["BytecodeGraph.cpp", "Sccp.cpp"]
+        };
         config
             .clone()
             .include(&bytecode_include_dir)
-            .add_files_by_ext_sorted(&bytecode_source_dir, "cpp")
+            .add_files_by_ext_sorted_except(&bytecode_source_dir, "cpp", bytecode_skip)
             .out_dir(&build_dir)
             .compile(bytecode_lib_name);
 
-        // Build `Inliner` library
+        // Build `Inliner` library (used only with codegen)
         let inliner_lib_name = "luauinliner";
         let inliner_source_dir = luau_source_dir.join("Inliner").join("src");
         let inliner_include_dir = luau_source_dir.join("Inliner").join("include");
-        config
-            .clone()
-            .include(&inliner_include_dir)
-            .include(&bytecode_include_dir)
-            .include(&bytecode_source_dir)
-            .include(&vm_include_dir)
-            .include(&vm_source_dir)
-            .define("LUAJITINLINER_API", "extern \"C\"")
-            .add_files_by_ext_sorted(&inliner_source_dir, "cpp")
-            .out_dir(&build_dir)
-            .compile(inliner_lib_name);
+        if self.enable_codegen {
+            config
+                .clone()
+                .include(&inliner_include_dir)
+                .include(&bytecode_include_dir)
+                .include(&bytecode_source_dir)
+                .include(&vm_include_dir)
+                .include(&vm_source_dir)
+                .define("LUAJITINLINER_API", "extern \"C\"")
+                .add_files_by_ext_sorted(&inliner_source_dir, "cpp")
+                .out_dir(&build_dir)
+                .compile(inliner_lib_name);
+        }
 
         // Build `Compiler` library
         let compiler_lib_name = "luaucompiler";
@@ -305,7 +314,6 @@ impl Build {
         let mut artifacts = Artifacts {
             lib_dir: build_dir,
             libs: vec![
-                inliner_lib_name.to_string(),
                 vm_lib_name.to_string(),
                 bytecode_lib_name.to_string(),
                 compiler_lib_name.to_string(),
@@ -319,6 +327,7 @@ impl Build {
         };
 
         if self.enable_codegen {
+            artifacts.libs.insert(0, inliner_lib_name.to_string());
             artifacts.libs.push(codegen_lib_name.to_string());
         }
 
@@ -388,18 +397,29 @@ impl Artifacts {
 }
 
 trait AddFilesByExt {
-    fn add_files_by_ext_sorted(&mut self, dir: &Path, ext: &str) -> &mut Self;
+    fn add_files_by_ext_sorted(&mut self, dir: &Path, ext: &str) -> &mut Self {
+        self.add_files_by_ext_sorted_except(dir, ext, &[])
+    }
+
+    fn add_files_by_ext_sorted_except(&mut self, dir: &Path, ext: &str, skip: &[&str])
+    -> &mut Self;
 }
 
 impl AddFilesByExt for cc::Build {
     // It's important to keep the order of the files to get consistent builds between machines
     // if the order is not always the same, the final binary produces a different SHA256 which
     // might cause issues if one needs to verify which binary is being executed
-    fn add_files_by_ext_sorted(&mut self, dir: &Path, ext: &str) -> &mut Self {
+    fn add_files_by_ext_sorted_except(
+        &mut self,
+        dir: &Path,
+        ext: &str,
+        skip: &[&str],
+    ) -> &mut Self {
         let mut sources: Vec<_> = fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension() == Some(ext.as_ref()))
+            .filter(|e| !skip.iter().any(|name| e.file_name() == *name))
             .map(|e| e.path())
             .collect();
 
