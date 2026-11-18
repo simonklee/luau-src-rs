@@ -43,8 +43,9 @@ changes=$(git status --porcelain --untracked-files=all --ignored -- Cargo.toml "
     die "commit or stash changes and move ignored files out of vendored components first"
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/luau-update.XXXXXX")
-# The new manifest is written next to the old one, so that installing it is a rename.
-staged=.Cargo.toml.update
+# The new manifest is staged next to the old one (so installing it is a rename), under
+# a unique name created after the dry-run exit; the trap removes only that file.
+staged=
 replaced=
 cleanup() {
     status=$?
@@ -59,7 +60,7 @@ cleanup() {
                 }
         done
     fi
-    rm -f "$staged"
+    [ -z "$staged" ] || rm -f "$staged"
     rm -rf "$temporary"
     exit "$status"
 }
@@ -98,6 +99,8 @@ if [ "$dry_run" = true ]; then
 fi
 
 # Stage and validate before replacing anything; preserve Custom and local files.
+staged=$(mktemp .Cargo.toml.update.XXXXXX)
+cp -p Cargo.toml "$staged"
 sed "s|^version = \"[^\"]*\"$|version = \"$crate_version\"|" Cargo.toml > "$staged"
 mkdir "$temporary/backup"
 for component in $components; do
