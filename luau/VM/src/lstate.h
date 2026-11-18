@@ -234,6 +234,7 @@ typedef struct global_State
 
     struct lua_Page* freepages[LUA_SIZECLASSES]; // free page linked list for each size class for non-collectable objects
     struct lua_Page* freegcopages[LUA_SIZECLASSES]; // free page linked list for each size class for collectable objects
+    uint8_t pagechurn[2][LUA_SIZECLASSES]; // with LuauSmallPages: each size class's page floor (lmem.cpp); [0] other blocks, [1] GCOs
     struct lua_Page* allpages; // page linked list with all pages for all non-collectable object classes (available with LUAU_ASSERTENABLED)
     struct lua_Page* allgcopages; // page linked list with all pages for all collectable object classes
     struct lua_Page* sweepgcopage; // position of the sweep in `allgcopages'

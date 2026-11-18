@@ -51,18 +51,21 @@
 ** bit 1 - object is white (type 1)
 ** bit 2 - object is black
 ** bit 3 - object is fixed (should not be collected)
+** bit 4 - table is a constructor template with nil fields (lvmload); the GC keeps its nil-valued keys
 */
 
 #define WHITE0BIT 0
 #define WHITE1BIT 1
 #define BLACKBIT 2
 #define FIXEDBIT 3
+#define TEMPLATEBIT 4
 #define WHITEBITS bit2mask(WHITE0BIT, WHITE1BIT)
 
 #define iswhite(x) test2bits((x)->gch.marked, WHITE0BIT, WHITE1BIT)
 #define isblack(x) testbit((x)->gch.marked, BLACKBIT)
 #define isgray(x) (!testbits((x)->gch.marked, WHITEBITS | bitmask(BLACKBIT)))
 #define isfixed(x) testbit((x)->gch.marked, FIXEDBIT)
+#define istemplate(x) testbit((x)->gch.marked, TEMPLATEBIT)
 
 #define otherwhite(g) (g->currentwhite ^ WHITEBITS)
 #define isdead(g, v) (((v)->gch.marked & (WHITEBITS | bitmask(FIXEDBIT))) == (otherwhite(g) & WHITEBITS))

@@ -3,11 +3,15 @@
 #include "lualib.h"
 
 #include "lstring.h"
-#include "lnumutils.h"
 
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>
+
+// After <ctype.h>: lnumutils.h includes C++ headers, and libstdc++'s configuration defines __NO_CTYPE, which turns
+// glibc's inline ctype functions (tolower, isalpha, ...) into a library call per character
+// Keep this include below <ctype.h>: the order is what keeps glibc's inline ctype functions
+#include "lnumutils.h"
 
 #ifdef _MSC_VER
 #include <intrin.h>

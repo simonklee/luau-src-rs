@@ -52,6 +52,11 @@ LUAI_FUNC void* luaM_realloc_(lua_State* L, void* block, size_t osize, size_t ns
 
 LUAI_FUNC l_noret luaM_toobig(lua_State* L);
 
+// with LuauSmallPages: frees the empty pages size classes kept; with cycle, a GC cycle completed, and the floors of quiet
+// classes decay
+LUAI_FUNC void luaM_endcycle(lua_State* L, bool cycle);
+LUAI_FUNC size_t luaM_countemptypages(lua_State* L); // non-GC pages with no block in use, for tests
+
 LUAI_FUNC void luaM_getpagewalkinfo(lua_Page* page, char** start, char** end, int* busyBlocks, int* blockSize);
 LUAI_FUNC void luaM_getpageinfo(lua_Page* page, int* pageBlocks, int* busyBlocks, int* blockSize, int* pageSize);
 LUAI_FUNC lua_Page* luaM_getnextpage(lua_Page* page);

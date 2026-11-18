@@ -76,8 +76,8 @@ LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauSmallPages, true)
  * size up to reduce the chance that we'll allocate pages that have very few allocated blocks. The size
  * class strategy is determined by SizeClassConfig constructor.
  *
- * With LuauSmallPages, pages are smaller while the heap is small (1K to 16K, by classpagesize); each page
- * records its own size, which freeing and page walks use.
+ * With LuauSmallPages, pages are smaller while the heap is small (1K to 16K, by classpagesize), unless their
+ * size class churns; each page records its own size, which freeing and page walks use.
  *
  * Note that when the last block in a page is freed, we immediately free the page with frealloc - the
  * memory manager doesn't currently attempt to keep unused memory around. This can result in excessive
@@ -160,6 +160,21 @@ const size_t kLargePageSize = 32 * 1024 - kExternalAllocatorMetaDataReduction;
 const size_t kMinPageSize = 1024;
 const size_t kGcoPageHeapRatio = 64;
 const size_t kBlockPageHeapRatio = 128;
+
+// a size class whose pages keep emptying (garbage churn) would turn small pages over every few blocks, so each
+// kChurnPagesPerLevel pages it frees double its smallest page, up to 16 KB; kChurnQuietCycles GC cycles in a row in which
+// it neither allocates nor frees a page halve it again. An idle VM's classes rarely free a page
+const int kChurnPagesPerLevel = 4;
+const int kChurnMaxLevel = 4; // kMinPageSize << 4 is 16 KB
+const int kChurnQuietCycles = 4;
+
+// pagechurn, one byte a size class: the pages it freed (up to kChurnPagesPerLevel * kChurnMaxLevel), the quiet GC cycles in
+// a row before this one (up to kChurnQuietCycles - 1), and whether it allocated or freed a page in this one
+static_assert(kChurnPagesPerLevel * kChurnMaxLevel <= 0x1f && kChurnQuietCycles <= 4, "pagechurn's fields overflow");
+const uint8_t kChurnCount = 0x1f;
+const uint8_t kChurnQuiet = 0x60;
+const uint8_t kChurnQuietOne = 0x20;
+const uint8_t kChurnActive = 0x80;
 
 const size_t kBlockHeader = sizeof(double) > sizeof(void*) ? sizeof(double) : sizeof(void*); // suitable for aligning double & void* on all platforms
 const size_t kGCOLinkOffset = (sizeof(GCheader) + sizeof(void*) - 1) & ~(sizeof(void*) - 1); // GCO pages contain freelist links after the GC header
@@ -386,7 +401,7 @@ static lua_Page* newpage(lua_State* L, lua_Page** pageset, int pageSize, int blo
 }
 
 // a small heap, such as an idle VM's, would otherwise hold a mostly empty 16 KB page for each size class in use
-static int classpagesize(global_State* g, int sizeOfClass, bool gco)
+static int classpagesize(global_State* g, int sizeOfClass, bool gco, int sizeClass)
 {
     static_assert(kMinPageSize - kExternalAllocatorMetaDataReduction - offsetof(lua_Page, data) >= kLargePageThreshold + kBlockHeader, "page too small");
     static_assert(kMinPageSize * 2 - kExternalAllocatorMetaDataReduction - offsetof(lua_Page, data) >= kMaxSmallSize + kBlockHeader, "page too small");
@@ -402,6 +417,12 @@ static int classpagesize(global_State* g, int sizeOfClass, bool gco)
     while (size < kSmallPageSize && size * ratio < g->totalbytes)
         size *= 2;
 
+    int level = (g->pagechurn[gco][sizeClass] & kChurnCount) / kChurnPagesPerLevel;
+    size_t floor = kMinPageSize << (level < kChurnMaxLevel ? level : kChurnMaxLevel);
+
+    if (size < floor)
+        size = floor;
+
     // at 16 KB, this is kSmallPageSize or kLargePageSize
     return int((large ? size * 2 : size) - kExternalAllocatorMetaDataReduction);
 }
@@ -413,11 +434,15 @@ template<AllocationPath path, int type, bool nothrow>
 LUAU_NOINLINE static lua_Page* newclasspage(lua_State* L, lua_Page** freepageset, lua_Page** pageset, uint8_t sizeClass, bool storeMetadata)
 {
     int sizeOfClass = kSizeClassConfig.sizeOfClass[sizeClass];
-    int pageSize = classpagesize(L->global, sizeOfClass, !storeMetadata);
+    int pageSize = classpagesize(L->global, sizeOfClass, !storeMetadata, sizeClass);
     int blockSize = sizeOfClass + (storeMetadata ? kBlockHeader : 0);
     int blockCount = (pageSize - offsetof(lua_Page, data)) / blockSize;
 
     lua_Page* page = newpage<path, type, nothrow>(L, pageset, pageSize, blockSize, blockCount);
+
+    // a refused page isn't activity: the class would never get small pages back at a memory cap
+    if (page)
+        L->global->pagechurn[!storeMetadata][sizeClass] |= kChurnActive;
 
     // prepend a page to page freelist (which is empty because we only ever allocate a new page when it is!)
     LUAU_ASSERT(!freepageset[sizeClass]);
@@ -470,6 +495,17 @@ static void freepage(lua_State* L, lua_Page** pageset, lua_Page* page)
         // so long
         pagealloc_DEPRECATED<path, type>(g, page, page->pageSize, 0);
     }
+}
+
+// a page of the size class emptied as its last block was freed
+static void countpagefree(global_State* g, bool gco, uint8_t sizeClass)
+{
+    uint8_t& churn = g->pagechurn[gco][sizeClass];
+
+    if ((churn & kChurnCount) < kChurnPagesPerLevel * kChurnMaxLevel)
+        churn++;
+
+    churn |= kChurnActive;
 }
 
 template<AllocationPath path, int type>
@@ -616,6 +652,16 @@ static void freeblock(lua_State* L, int sizeClass, void* block)
         LUAU_ASSERT(!page->prev);
         LUAU_ASSERT(!page->next);
 
+        // an empty page is kept only while it's the class's only page with free blocks
+        lua_Page* head = g->freepages[sizeClass];
+
+        if (head && head->busyBlocks == 0)
+        {
+            LUAU_ASSERT(!head->next);
+            countpagefree(g, false, sizeClass);
+            freeclasspage<AllocationPath::Frealloc, 0>(L, g->freepages, debugpageset(&g->allpages), head, sizeClass);
+        }
+
         page->next = g->freepages[sizeClass];
         if (page->next)
             page->next->prev = page;
@@ -630,9 +676,14 @@ static void freeblock(lua_State* L, int sizeClass, void* block)
 
     page->busyBlocks--;
 
-    // if it's the last block in the page, we don't need the page
-    if (page->busyBlocks == 0)
+    // if it's the last block in the page, we don't need the page; with LuauSmallPages, a class keeps its only page with
+    // free blocks, so a block that is allocated and freed over and over (an array growing through the class) doesn't
+    // turn a page over each time
+    if (page->busyBlocks == 0 && !(DFFlag::LuauSmallPages && !page->prev && !page->next))
+    {
+        countpagefree(g, false, sizeClass);
         freeclasspage<AllocationPath::Frealloc, 0>(L, g->freepages, debugpageset(&g->allpages), page, sizeClass);
+    }
 }
 
 template<AllocationPath path, int type>
@@ -672,7 +723,10 @@ static LUAU_FORCEINLINE void freegcoblock(lua_State* L, int sizeClass, void* blo
 
     // if it's the last block in the page, we don't need the page
     if (page->busyBlocks == 0)
+    {
+        countpagefree(L->global, true, sizeClass);
         freeclasspage<path, type>(L, freepages, allpages, page, sizeClass);
+    }
 }
 
 void* luaM_new_(lua_State* L, size_t nsize, uint8_t memcat)
@@ -1074,6 +1128,52 @@ void* luaM_realloc_(lua_State* L, void* block, size_t osize, size_t nsize, uint8
     }
 
     return result;
+}
+
+void luaM_endcycle(lua_State* L, bool cycle)
+{
+    global_State* g = L->global;
+
+    for (int i = 0; i < LUA_SIZECLASSES; i++)
+    {
+        // the empty page a class kept goes, so a collected heap holds no empty page
+        lua_Page* page = g->freepages[i];
+
+        if (page && page->busyBlocks == 0)
+        {
+            LUAU_ASSERT(!page->next);
+            freeclasspage<AllocationPath::Frealloc, 0>(L, g->freepages, debugpageset(&g->allpages), page, uint8_t(i));
+        }
+
+        if (!cycle)
+            continue;
+
+        // a class quiet for kChurnQuietCycles cycles in a row has stopped churning: its floor halves
+        for (int gco = 0; gco < 2; gco++)
+        {
+            uint8_t& churn = g->pagechurn[gco][i];
+            int count = churn & kChurnCount;
+
+            if (churn & kChurnActive)
+                churn = uint8_t(count);
+            else if ((churn & kChurnQuiet) / kChurnQuietOne + 1 >= kChurnQuietCycles)
+                churn = uint8_t(count > kChurnPagesPerLevel ? count - kChurnPagesPerLevel : 0);
+            else
+                churn += kChurnQuietOne;
+        }
+    }
+}
+
+size_t luaM_countemptypages(lua_State* L)
+{
+    global_State* g = L->global;
+    size_t count = 0;
+
+    for (int i = 0; i < LUA_SIZECLASSES; i++)
+        for (lua_Page* page = g->freepages[i]; page; page = page->next)
+            count += page->busyBlocks == 0;
+
+    return count;
 }
 
 void luaM_getpagewalkinfo(lua_Page* page, char** start, char** end, int* busyBlocks, int* blockSize)

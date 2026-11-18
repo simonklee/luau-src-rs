@@ -23,6 +23,7 @@ LUAU_FLAGVERSION(LuauGcTraceUdata, 5)
 LUAU_FASTFLAG(LuauCoroutineFinally)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcHeapShrinkFix, false)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcGoalByHeap, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTemplateNilSlots, true)
 LUAU_FASTFLAGVARIABLE(LuauRuntimeFeedback)
 LUAU_FLAGVERSION(LuauRuntimeFeedback, 2)
 LUAU_FASTFLAG(LuauBufferSweep)
@@ -371,13 +372,26 @@ static int traversetable(global_State* g, LuaTable* h)
         while (i--)
             markvalue(g, &h->array[i]);
     }
+    // A constructor template keeps the keys of its fields written `= nil`, so that every clone has their slots and a
+    // later write to one doesn't go through luaH_newkey. The keys are constants of the template's proto, so marking
+    // them keeps nothing alive that the proto doesn't.
+    bool keepnilkeys = DFFlag::LuauTemplateNilSlots && istemplate(obj2gco(h)) && !weakkey;
     i = sizenode(h);
     while (i--)
     {
         LuaNode* n = gnode(h, i);
         LUAU_ASSERT(ttype(gkey(n)) != LUA_TDEADKEY || ttisnil(gval(n)));
         if (ttisnil(gval(n)))
-            removeentry(n); // remove empty entries
+        {
+            if (keepnilkeys && ttype(gkey(n)) != LUA_TDEADKEY)
+            {
+                markvalue(g, gkey(n));
+            }
+            else
+            {
+                removeentry(n); // remove empty entries
+            }
+        }
         else
         {
             LUAU_ASSERT(!ttisnil(gkey(n)));
@@ -869,6 +883,8 @@ static void shrinkbuffers(lua_State* L)
     // check size of string hash
     if (g->strt.nuse < cast_to(uint32_t, g->strt.size / 4) && g->strt.size > LUA_MINSTRTABSIZE * 2)
         stringresizeprotected(L, g->strt.size / 2); // table is too big
+
+    luaM_endcycle(L, true);
 }
 
 static void shrinkbuffersfull(lua_State* L)
@@ -880,6 +896,9 @@ static void shrinkbuffersfull(lua_State* L)
         hashsize /= 2;
     if (hashsize != g->strt.size)
         stringresizeprotected(L, hashsize); // table is too big
+
+    // the cycle that just ended went through shrinkbuffers, which counted it
+    luaM_endcycle(L, false);
 }
 
 static bool deletegco(void* context, lua_Page* page, GCObject* gco)
@@ -1424,7 +1443,7 @@ static int getgcstepmul(global_State* g)
 static const size_t kHeapLimit = sizeof(size_t) < sizeof(int64_t) ? SIZE_MAX - 1 : size_t(INT64_MAX / 2);
 
 // a * b / c rounded down, exactly, saturated at kHeapLimit; c must not be 0
-static size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
+static LUAU_NOINLINE size_t muldivwide(uint64_t a, uint64_t b, uint64_t c)
 {
     // a * (b / c) + (a / c) * (b % c) + (a % c) * (b % c) / c: only the first term can overflow
     uint64_t bq = b / c;
@@ -1437,6 +1456,21 @@ static size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
     uint64_t rest = (a / c) * br + (a % c) * br / c;
 
     return rest >= kHeapLimit - r ? kHeapLimit : size_t(r + rest);
+}
+
+// muldivwide, with a fast path for 32-bit operands, which step sizes, step multipliers and most debts are: their product
+// fits in 64 bits; inlined, so that a constant c turns the division into a multiplication; larger operands, such as the
+// debt of a heap over 4 GB, take the exact wide path
+static LUAU_FORCEINLINE size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
+{
+    if ((a | b) <= UINT32_MAX)
+    {
+        uint64_t r = a * b / c;
+
+        return r < kHeapLimit ? size_t(r) : kHeapLimit;
+    }
+
+    return muldivwide(a, b, c);
 }
 
 // the heap goal for a goal in percent; a goal of 0 or less gives 0

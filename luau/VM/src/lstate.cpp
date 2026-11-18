@@ -93,6 +93,7 @@ static void close_state(lua_State* L)
     LUAU_ASSERT(g->strt.nuse == 0);
     luaM_freearray(L, L->global->strt.hash, L->global->strt.size, TString*, 0);
     freestack(L, L);
+    luaM_endcycle(L, false);
     for (int i = 0; i < LUA_SIZECLASSES; i++)
     {
         LUAU_ASSERT(g->freepages[i] == NULL);

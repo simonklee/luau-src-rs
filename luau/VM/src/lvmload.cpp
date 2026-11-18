@@ -747,6 +747,10 @@ static void loadProto(
                 setnilvalue(val);
             }
 
+            // a field written `= nil` keeps its slot in every clone only if the GC keeps the key (traversetable)
+            if (nilKeysSize > 0)
+                l_setbit(h->marked, TEMPLATEBIT);
+
             sethvalue(L, &p->k[j], h);
             break;
         }
