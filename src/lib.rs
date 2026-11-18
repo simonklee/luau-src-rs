@@ -167,6 +167,9 @@ impl Build {
         if cfg!(debug_assertions) {
             config.define("LUAU_ENABLE_ASSERT", None);
         } else {
+            // Luau enables LUAU_ASSERT whenever NDEBUG is undefined (Common.h), so without this
+            // release builds kept every VM assert; upstream's release builds define it too
+            config.define("NDEBUG", None);
             // this flag allows compiler to lower sqrt() into a single CPU instruction
             config.flag_if_supported("-fno-math-errno");
         }
