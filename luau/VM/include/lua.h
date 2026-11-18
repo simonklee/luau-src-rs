@@ -393,6 +393,59 @@ LUA_API l_noret lua_error(lua_State* L);
 LUA_API int lua_next(lua_State* L, int idx);
 LUA_API int lua_rawiter(lua_State* L, int idx, int iter);
 
+/*
+** lua_rawiterpeek: lua_rawiter that describes a slot's key and value instead of pushing them
+**
+** It steps through the table at idx as lua_rawiter(L, idx, iter) does: the same slots in the same order (the array
+** part, then the hash part), the same return value (the iter of the next call, or -1 when the walk is done) and the
+** same rule for changing the table during the walk (fields that exist may be assigned, nil included; no new fields).
+** idx must refer to a table, iter must not be negative (0 starts the walk) and value must not be NULL. As for
+** lua_rawiter, these are checked only when Luau is built with its asserts on (LUAU_ASSERT); with NDEBUG, a misuse is
+** undefined behavior.
+**
+** When it returns a slot, it writes the slot's key to *key (key may be NULL) and its value to *value. Every field is
+** written: the ones the type does not use get -1, 0 or NULL. When it returns -1, it writes nothing. It pushes nothing,
+** unless flags has LUA_PEEKPUSH and the value is not a boolean, number or string (a table, for one); then it pushes
+** the value, and the caller pops it. A key is never pushed; for a key of another type, lua_rawiter(L, idx, iter), with
+** the same iter, pushes this slot's key and value.
+**
+** It never allocates, never runs the GC, never calls a metamethod or a callback (not even useratom) and never raises
+** an error, with one exception: LUA_PEEKPUSH grows the stack, as lua_rawiter does, when it has no free slot. That
+** allocates, and it raises an error if the stack can't grow ("stack overflow" at LUAI_MAXCSTACK, or LUA_ERRMEM).
+** Reserving one free slot for each pushed value the caller keeps on the stack at once (lua_checkstack) avoids it.
+**
+** A string's atom is reported as the string holds it, without calling useratom. useratom gives a string its atom
+** lazily, through lua_tostringatom and its kin, and the string keeps it; until then the atom is below -1. To give a key
+** its atom, push the slot with lua_rawiter(L, idx, iter), with the same iter, and call lua_tostringatom on the key;
+** later walks then see it. A string made anew on every call pays that every time; matching its bytes may be cheaper.
+**
+** str points into the string object; never write through it. Luau's GC never moves objects, so str stays valid as long
+** as the string stays reachable:
+** - always until the next call that can run the GC: any call that allocates or runs Luau code;
+** - across GC steps too, only while the table at idx stays reachable (on the stack, say), has no __mode in its
+**   metatable, and this slot keeps its key and value. In a weak table (__mode with 'k' or 'v', frozen or not) the
+**   GC itself may clear the slot while the table is still on the stack, and free the string in the same GC step
+**   ('kv'). Any call that allocates can run that step: two lua_pushlstring calls are enough.
+** A GC step between two calls may also shrink a weak table with 's' in its __mode and move its slots, so that walk
+** may miss or repeat a pair, as a lua_rawiter walk may.
+*/
+typedef struct lua_Peek
+{
+    int type;        // the key's or value's LUA_T* type, as lua_type returns it
+    int atom;        // LUA_TSTRING: the string's atom as stored, below -1 if useratom hasn't seen it; otherwise -1
+    int boolean;     // LUA_TBOOLEAN: 0 or 1; otherwise 0
+    double number;   // LUA_TNUMBER: the number; otherwise 0
+    const char* str; // LUA_TSTRING: the bytes, with a NUL after the last (the string may hold NULs too); otherwise NULL
+    size_t len;      // LUA_TSTRING: the length in bytes; otherwise 0
+} lua_Peek;
+
+enum lua_PeekFlags
+{
+    LUA_PEEKPUSH = 1 << 0, // push a value that is not a boolean, number or string
+};
+
+LUA_API int lua_rawiterpeek(lua_State* L, int idx, int iter, lua_Peek* key, lua_Peek* value, int flags);
+
 LUA_API void lua_concat(lua_State* L, int n);
 
 LUA_API void lua_setpointerencodekey(lua_State* L, uint64_t a, uint64_t b, uint64_t c, uint64_t d);

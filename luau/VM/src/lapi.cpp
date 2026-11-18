@@ -1644,6 +1644,83 @@ int lua_rawiter(lua_State* L, int idx, int iter)
     return -1;
 }
 
+// one key or value into a lua_Peek, from a TValue's or a TKey's parts; a string's atom as it is stored, so that nothing
+// calls out of the VM (useratom could run the GC, which may free or move the slot)
+static void peekslot(lua_Peek* out, int tt, const Value& v)
+{
+    out->type = tt;
+    out->atom = -1;
+    out->boolean = tt == LUA_TBOOLEAN ? v.b : 0;
+    out->number = tt == LUA_TNUMBER ? v.n : 0;
+    out->str = NULL;
+    out->len = 0;
+    if (tt == LUA_TSTRING)
+    {
+        TString* ts = &v.gc->ts;
+        out->str = getstr(ts);
+        out->len = ts->len;
+        out->atom = ts->atom; // ATOM_UNDEF (below -1) until useratom has seen the string
+    }
+}
+
+int lua_rawiterpeek(lua_State* L, int idx, int iter, lua_Peek* key, lua_Peek* value, int flags)
+{
+    const TValue* t = index2addr(L, idx);
+    api_check(L, ttistable(t));
+    api_check(L, iter >= 0);
+    api_check(L, value);
+
+    LuaTable* h = hvalue(t);
+    int sizearray = h->sizearray;
+    const TValue* v;
+
+    // the array part, as lua_rawiter
+    for (; unsigned(iter) < unsigned(sizearray); ++iter)
+    {
+        v = &h->array[iter];
+
+        if (!ttisnil(v))
+        {
+            if (key)
+            {
+                Value k;
+                k.n = double(iter + 1);
+                peekslot(key, LUA_TNUMBER, k);
+            }
+            goto found;
+        }
+    }
+
+    // then the hash part
+    for (int sizenode = 1 << h->lsizenode; unsigned(iter - sizearray) < unsigned(sizenode); ++iter)
+    {
+        const LuaNode* n = &h->node[iter - sizearray];
+        v = gval(n);
+
+        if (!ttisnil(v))
+        {
+            if (key)
+                peekslot(key, n->key.tt, n->key.value);
+            goto found;
+        }
+    }
+
+    return -1;
+
+found:
+    peekslot(value, ttype(v), v->value);
+
+    if ((flags & LUA_PEEKPUSH) && !ttisboolean(v) && !ttisnumber(v) && !ttisstring(v))
+    {
+        // v is in the table, not on the stack, so growing the stack leaves it valid; growing allocates, but runs no GC
+        ensure_stack(L, 1);
+        luaC_threadbarrier(L);
+        setobj2s(L, L->top, v);
+        api_incr_top(L);
+    }
+    return iter + 1;
+}
+
 void lua_concat(lua_State* L, int n)
 {
     api_check(L, n >= 0);
