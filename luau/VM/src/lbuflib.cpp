@@ -3,6 +3,7 @@
 
 #include "lcommon.h"
 #include "lbuffer.h"
+#include "lnumutils.h"
 
 #if defined(LUAU_BIG_ENDIAN)
 #include <endian.h>
@@ -281,7 +282,8 @@ static int buffer_copy(lua_State* L)
     void* sbuf = luaL_checkbuffer(L, 3, &slen);
     int soffset = luaL_optinteger(L, 4, 0);
 
-    int size = luaL_optinteger(L, 5, int(slen) - soffset);
+    // the default size is formed without subtracting an offset that might be out of range; a negative size is out of bounds below
+    int size = luaL_optinteger(L, 5, unsigned(soffset) <= slen ? int(slen - unsigned(soffset)) : -1);
 
     if (size < 0)
         luaL_error(L, "buffer access out of bounds");
@@ -302,7 +304,7 @@ static int buffer_fill(lua_State* L)
     void* buf = luaL_checkbuffer(L, 1, &len);
     int offset = luaL_checkinteger(L, 2);
     unsigned value = luaL_checkunsigned(L, 3);
-    int size = luaL_optinteger(L, 4, int(len) - offset);
+    int size = luaL_optinteger(L, 4, unsigned(offset) <= len ? int(len - unsigned(offset)) : -1);
 
     if (size < 0)
         luaL_error(L, "buffer access out of bounds");
@@ -318,7 +320,7 @@ static int buffer_readbits(lua_State* L)
 {
     size_t len = 0;
     void* buf = luaL_checkbuffer(L, 1, &len);
-    int64_t bitoffset = (int64_t)luaL_checknumber(L, 2);
+    int64_t bitoffset = luai_numtoint64(luaL_checknumber(L, 2));
     int bitcount = luaL_checkinteger(L, 3);
 
     if (bitoffset < 0)
@@ -353,7 +355,7 @@ static int buffer_writebits(lua_State* L)
 {
     size_t len = 0;
     void* buf = luaL_checkbuffer(L, 1, &len);
-    int64_t bitoffset = (int64_t)luaL_checknumber(L, 2);
+    int64_t bitoffset = luai_numtoint64(luaL_checknumber(L, 2));
     int bitcount = luaL_checkinteger(L, 3);
     unsigned value = luaL_checkunsigned(L, 4);
 

@@ -3,6 +3,7 @@
 #include "lualib.h"
 
 #include "lstate.h"
+#include "lnumutils.h"
 
 #include <limits>
 #include <math.h>
@@ -336,9 +337,9 @@ static float perlin(float x, float y, float z)
     float yflr = floorf(y);
     float zflr = floorf(z);
 
-    int xi = int(xflr) & 255;
-    int yi = int(yflr) & 255;
-    int zi = int(zflr) & 255;
+    int xi = luai_numtoint(xflr) & 255;
+    int yi = luai_numtoint(yflr) & 255;
+    int zi = luai_numtoint(zflr) & 255;
 
     float xf = x - xflr;
     float yf = y - yflr;

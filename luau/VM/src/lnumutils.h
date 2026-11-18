@@ -2,8 +2,13 @@
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #pragma once
 
+#include <limits.h>
 #include <math.h>
 #include <cstdint>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 #define luai_numadd(a, b) ((a) + (b))
 #define luai_numsub(a, b) ((a) - (b))
@@ -98,7 +103,34 @@ inline double luai_lerpd(double a, double b, double t)
     return (t == 1.0) ? b : a + (b - a) * t;
 }
 
-#define luai_num2int(i, d) ((i) = (int)(d))
+// Casting a value not representable in the target type is undefined behavior, so values out of range and NaN convert to the minimum value instead
+// On x86-64, cvttsd2si is defined to produce exactly that, so we use it directly and the conversion stays a single instruction
+// Elsewhere, we check the range first; the minimum value itself is in range and converts to the same result, so one comparison of fabs is enough
+inline int luai_numtoint(double n)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    return _mm_cvttsd_si32(_mm_set_sd(n));
+#else
+    return fabs(n) < 2147483648.0 ? int(n) : INT_MIN;
+#endif
+}
+
+inline int64_t luai_numtoint64(double n)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    return _mm_cvttsd_si64(_mm_set_sd(n));
+#else
+    return fabs(n) < 9223372036854775808.0 ? int64_t(n) : INT64_MIN;
+#endif
+}
+
+// Values within the 64-bit integer range wrap around modulo 2^32; values out of range and NaN convert to 0
+inline unsigned luai_numtounsigned(double n)
+{
+    return unsigned(luai_numtoint64(n));
+}
+
+#define luai_num2int(i, d) ((i) = luai_numtoint(d))
 
 #define luai_fabs condvectordouble(fabs, fabsf)
 #define luai_sqrt condvectordouble(sqrt, sqrtf)
@@ -118,7 +150,7 @@ inline double luai_lerpd(double a, double b, double t)
         i = (unsigned int)l; \
     }
 #else
-#define luai_num2unsigned(i, n) ((i) = (unsigned)(long long)(n))
+#define luai_num2unsigned(i, n) ((i) = luai_numtounsigned(n))
 #endif
 
 #define LUAI_MAXNUM2STR 48

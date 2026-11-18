@@ -3,6 +3,7 @@
 #include "lualib.h"
 
 #include "lstring.h"
+#include "lnumutils.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -17,6 +18,7 @@ LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLinearStringSearch, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauPatternBudget, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauStringPackInterrupt, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauPatternClassScan, true)
 
 // macro to `unsign' a character
 #define uchar(c) ((unsigned char)(c))
@@ -1109,6 +1111,229 @@ static void reprepstate(MatchState* ms)
     LUAU_ASSERT(ms->matchdepth == LUAI_MAXCCALLS);
 }
 
+// With LuauPatternClassScan, a pattern that is a single class ('.', a byte, a %-class or a set), alone or followed by
+// '*', '+' or '-', with no anchor or capture, scans the subject against a table of the 256 bytes instead of going through
+// match(). The table starts unknown, and singlematch()'s own test fills in each byte the first time the scan meets it, so
+// the results are match()'s, and a call tests each byte value at most once. The scan charges a unit for each byte it
+// compares and one for each match, and a set's test is charged by its length, as in matchset; so it needs
+// LuauPatternBudget's counter.
+enum
+{
+    CLASSSCAN_UNKNOWN,
+    CLASSSCAN_OUT,
+    CLASSSCAN_IN,
+};
+
+struct ClassScan
+{
+    const char* p;  // the class
+    const char* ep; // its end
+    char op;        // 0, '*', '+' or '-'
+    uint8_t set[256];
+};
+
+// checks if p is one of the forms above, and prepares cs for it; any other pattern, a malformed one included, takes
+// match()
+static bool classscan_compile(MatchState* ms, ClassScan* cs, const char* p, size_t lp)
+{
+    const char* end = p + lp;
+    const char* ep;
+
+    if (lp == 0)
+        return false;
+
+    switch (*p)
+    {
+    case '^':
+    case '$':
+    case '(':
+    case ')':
+        return false;
+    case L_ESC:
+        if (lp < 2 || p[1] == 'b' || p[1] == 'f' || isdigit(uchar(p[1])))
+            return false;
+        ep = p + 2;
+        break;
+    case '[':
+    {
+        // classend's search for the ']', without its errors; charged as it is, whether the pattern qualifies or not, so
+        // that classend's own scan of a pattern that doesn't doesn't follow it uncharged
+        const char* q = p + 1;
+        if (*q == '^')
+            q++;
+        do
+        {
+            if (q == end)
+                break;
+            if (*(q++) == L_ESC && q < end)
+                q++;
+        } while (*q != ']');
+        match_charge(ms, q - p - 1);
+        if (q == end)
+            return false;
+        ep = q + 1;
+        break;
+    }
+    default:
+        ep = p + 1;
+        break;
+    }
+
+    if (ep == end)
+        cs->op = 0;
+    else if (ep + 1 == end && (*ep == '*' || *ep == '+' || *ep == '-'))
+        cs->op = *ep;
+    else
+        return false;
+
+    cs->p = p;
+    cs->ep = ep;
+    memset(cs->set, *p == '.' ? CLASSSCAN_IN : CLASSSCAN_UNKNOWN, sizeof(cs->set));
+    return true;
+}
+
+// singlematch()'s test of the byte c, into the table
+static LUAU_NOINLINE void classscan_resolve(MatchState* ms, ClassScan* cs, int c)
+{
+    const char* p = cs->p;
+    int res;
+    switch (*p)
+    {
+    case L_ESC:
+        res = match_class(c, uchar(*(p + 1)));
+        break;
+    case '[':
+        res = matchset(ms, c, p, cs->ep - 1);
+        break;
+    default:
+        res = (uchar(*p) == c);
+        break;
+    }
+    cs->set[c] = res ? CLASSSCAN_IN : CLASSSCAN_OUT;
+}
+
+// the first byte at or after s that is in the class (In) or not (!In), or src_end; it scans in stretches that the work
+// left pays for, plus one byte, and charges each after it, so that the loop over the bytes doesn't store or call
+template<bool In>
+static const char* classscan_span(MatchState* ms, ClassScan* cs, const char* s)
+{
+    const uint8_t skip = In ? CLASSSCAN_OUT : CLASSSCAN_IN;
+    for (;;)
+    {
+        const char* stop = ms->src_end - s > ms->work ? s + ms->work + 1 : ms->src_end;
+        const char* q = s;
+        while (q < stop && cs->set[uchar(*q)] == skip)
+            q++;
+        if (q < stop && cs->set[uchar(*q)] == CLASSSCAN_UNKNOWN)
+        {
+            // a byte value the scan hasn't met: test it, and scan on from it
+            match_charge(ms, q - s);
+            classscan_resolve(ms, cs, uchar(*q));
+            s = q;
+            continue;
+        }
+        // the byte that ended the scan was compared too
+        match_charge(ms, (q - s) + (q < stop));
+        if (q < stop || q == ms->src_end)
+            return q;
+        s = q;
+    }
+}
+
+// where the first match at or after s starts, or NULL: match()'s result at each position from s to src_end
+static const char* classscan_find(MatchState* ms, ClassScan* cs, const char* s)
+{
+    // '*' and '-' accept an empty match
+    if (cs->op == '*' || cs->op == '-')
+        return s;
+
+    const char* q = classscan_span<true>(ms, cs, s);
+    return q < ms->src_end ? q : NULL;
+}
+
+// where the match that starts at s (from classscan_find) ends
+static const char* classscan_match(MatchState* ms, ClassScan* cs, const char* s)
+{
+    // as match()'s step, so that empty matches are charged
+    match_charge(ms, 1);
+
+    // '.' matches every byte, so there is nothing to scan, as in max_scan
+    if (*cs->p == '.' && (cs->op == '*' || cs->op == '+'))
+        return ms->src_end;
+
+    switch (cs->op)
+    {
+    case '+':
+        return classscan_span<false>(ms, cs, s + 1);
+    case '*':
+        return classscan_span<false>(ms, cs, s);
+    case '-':
+        return s;
+    default:
+        return s + 1;
+    }
+}
+
+static bool classscan_init(MatchState* ms, ClassScan* cs, const char* p, size_t lp)
+{
+    return DFFlag::LuauPatternClassScan && ms->budget && classscan_compile(ms, cs, p, lp);
+}
+
+// str_find_aux with a class pattern, from s1
+static int str_find_class(MatchState* ms, ClassScan* cs, const char* s1, int find)
+{
+    reprepstate(ms);
+    if (const char* s = classscan_find(ms, cs, s1))
+    {
+        const char* e = classscan_match(ms, cs, s);
+        if (find)
+        {
+            lua_pushinteger(ms->L, (int)(s - ms->src_init + 1)); // start
+            lua_pushinteger(ms->L, (int)(e - ms->src_init));     // end
+            return 2;
+        }
+        else
+            return push_captures(ms, s, e);
+    }
+    lua_pushnil(ms->L); // not found
+    return 1;
+}
+
+// with a class pattern, gmatch keeps its table in a buffer, the iterator's fourth upvalue, so that each call doesn't test
+// the bytes again; returns whether it pushed one
+static int gmatch_classscan(lua_State* L)
+{
+    MatchState ms;
+    size_t ls, lp;
+    const char* s = lua_tolstring(L, 1, &ls);
+    const char* p = lua_tolstring(L, 2, &lp);
+    prepstate(&ms, L, s, ls, p, lp);
+    ClassScan cs;
+    if (!classscan_init(&ms, &cs, p, lp))
+        return 0;
+    // the class points into the pattern, which the iterator keeps
+    memcpy(lua_newbuffer(L, sizeof(cs)), &cs, sizeof(cs));
+    return 1;
+}
+
+// gmatch_aux with a class pattern, from src
+static int gmatch_class(MatchState* ms, ClassScan* cs, const char* src)
+{
+    reprepstate(ms);
+    const char* s = src <= ms->src_end ? classscan_find(ms, cs, src) : NULL;
+    if (!s)
+        return 0; // not found
+    const char* e = classscan_match(ms, cs, s);
+    int newstart = (int)(e - ms->src_init);
+    if (e == s)
+        newstart++; // empty match? go at least one position
+    // the captures go first, as in gmatch_aux
+    int n = push_captures(ms, s, e);
+    lua_pushinteger(ms->L, newstart);
+    lua_replace(ms->L, lua_upvalueindex(3));
+    return n;
+}
+
 static int str_find_aux(lua_State* L, int find)
 {
     size_t ls, lp;
@@ -1145,6 +1370,9 @@ static int str_find_aux(lua_State* L, int find)
             lp--; // skip anchor character
         }
         prepstate(&ms, L, s, ls, p, lp);
+        ClassScan cs;
+        if (!anchor && classscan_init(&ms, &cs, p, lp))
+            return str_find_class(&ms, &cs, s1, find);
         do
         {
             const char* res;
@@ -1184,6 +1412,9 @@ static int gmatch_aux(lua_State* L)
     const char* p = lua_tolstring(L, lua_upvalueindex(2), &lp);
     const char* src;
     prepstate(&ms, L, s, ls, p, lp);
+    ClassScan* cs = (ClassScan*)lua_tobuffer(L, lua_upvalueindex(4), NULL);
+    if (cs && DFFlag::LuauPatternClassScan && ms.budget)
+        return gmatch_class(&ms, cs, s + (size_t)lua_tointeger(L, lua_upvalueindex(3)));
     for (src = s + (size_t)lua_tointeger(L, lua_upvalueindex(3)); src <= ms.src_end; src++)
     {
         const char* e;
@@ -1213,7 +1444,8 @@ static int gmatch(lua_State* L)
     luaL_checkstring(L, 2);
     lua_settop(L, 2);
     lua_pushinteger(L, 0);
-    lua_pushcclosure(L, gmatch_aux, NULL, 3);
+    int nup = 3 + gmatch_classscan(L);
+    lua_pushcclosure(L, gmatch_aux, NULL, nup);
     return 1;
 }
 
@@ -1340,6 +1572,54 @@ static const char* findliteral(const char* s, const char* end, const char* p, si
     return NULL;
 }
 
+// str_gsub's loop with a class pattern: the bytes before a match are added at once, not one at a time
+static int str_gsub_class(MatchState* ms, ClassScan* cs, luaL_Strbuf* b, const char* src, int tr, int max_s)
+{
+    // a replacement string without escapes is added as is, as in the literal path; this is determined on the first match
+    int plainrepl = -1;
+    const char* repl = NULL;
+    size_t repll = 0;
+
+    int n = 0;
+    while (n < max_s)
+    {
+        const char* s = classscan_find(ms, cs, src);
+        if (!s)
+            break;
+        if (s != src)
+            luaL_addlstring(b, src, s - src);
+        src = s;
+        const char* e = classscan_match(ms, cs, src);
+        n++;
+        if (plainrepl < 0)
+        {
+            repl = (tr == LUA_TSTRING || tr == LUA_TNUMBER) ? lua_tolstring(ms->L, 3, &repll) : NULL;
+            plainrepl = repl && !memchr(repl, L_ESC, repll);
+        }
+        if (plainrepl)
+        {
+            // a unit for each byte of the replacement, as add_s charges
+            match_charge(ms, repll);
+            luaL_addlstring(b, repl, repll);
+        }
+        else
+        {
+            reprepstate(ms);
+            add_value(ms, b, src, e, tr);
+        }
+        if (e > src) // non empty match?
+            src = e; // skip it
+        else if (src < ms->src_end)
+            luaL_addchar(b, *src++);
+        else
+            break;
+    }
+    luaL_addlstring(b, src, ms->src_end - src);
+    luaL_pushresult(b);
+    lua_pushinteger(ms->L, n); // number of substitutions
+    return 2;
+}
+
 static int str_gsub(lua_State* L)
 {
     size_t srcl, lp;
@@ -1410,6 +1690,9 @@ static int str_gsub(lua_State* L)
     }
     else
     {
+        ClassScan cs;
+        if (!anchor && classscan_init(&ms, &cs, p, lp))
+            return str_gsub_class(&ms, &cs, &b, src, tr, max_s);
         while (n < max_s)
         {
             const char* e;
@@ -1563,7 +1846,7 @@ static int str_format(lua_State* L)
             {
             case 'c':
             {
-                int count = snprintf(buff, sizeof(buff), form, (int)luaL_checknumber(L, arg));
+                int count = snprintf(buff, sizeof(buff), form, luai_numtoint(luaL_checknumber(L, arg)));
                 luaL_addlstring(&b, buff, count);
                 continue; // skip the 'luaL_addlstring' at the end
             }
@@ -1571,7 +1854,7 @@ static int str_format(lua_State* L)
             case 'i':
             {
                 addInt64Format(form, formatIndicator, formatItemSize);
-                snprintf(buff, sizeof(buff), form, static_cast<long long>(luaL_checknumber(L, arg)));
+                snprintf(buff, sizeof(buff), form, static_cast<long long>(luai_numtoint64(luaL_checknumber(L, arg))));
                 break;
             }
             case 'o':
@@ -1581,7 +1864,9 @@ static int str_format(lua_State* L)
             {
                 double argValue = luaL_checknumber(L, arg);
                 addInt64Format(form, formatIndicator, formatItemSize);
-                unsigned long long v = (argValue < 0) ? (unsigned long long)(long long)argValue : (unsigned long long)argValue;
+                // values in [2^63, 2^64) only fit in unsigned long long; the rest converts as a signed 64-bit integer
+                bool unsignedonly = argValue >= 9223372036854775808.0 && argValue < 18446744073709551616.0;
+                unsigned long long v = unsignedonly ? (unsigned long long)argValue : (unsigned long long)luai_numtoint64(argValue);
                 snprintf(buff, sizeof(buff), form, v);
                 break;
             }
@@ -2119,7 +2404,7 @@ static int str_pack(lua_State* L)
         {
         case Kint:
         { // signed integers
-            long long n = (long long)luaL_checknumber(L, arg);
+            long long n = luai_numtoint64(luaL_checknumber(L, arg));
             if (size < SZINT)
             { // need overflow check?
                 long long lim = (long long)1 << ((size * NB) - 1);
@@ -2130,7 +2415,7 @@ static int str_pack(lua_State* L)
         }
         case Kuint:
         { // unsigned integers
-            long long n = (long long)luaL_checknumber(L, arg);
+            long long n = luai_numtoint64(luaL_checknumber(L, arg));
             if (size < SZINT) // need overflow check?
                 luaL_argcheck(L, (unsigned long long)n < ((unsigned long long)1 << (size * NB)), arg, "unsigned overflow");
             packint(&b, (unsigned long long)n, h.islittle, size, 0);

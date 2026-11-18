@@ -780,7 +780,7 @@ reentry:
                     LuaTable* h = hvalue(rb);
 
                     double indexd = nvalue(rc);
-                    int index = int(indexd);
+                    int index = luai_numtoint(indexd);
 
                     // index has to be an exact integer and in-bounds for the array portion
                     if (LUAU_LIKELY(unsigned(index) - 1 < unsigned(h->sizearray) && !h->metatable && double(index) == indexd))
@@ -810,7 +810,7 @@ reentry:
                     LuaTable* h = hvalue(rb);
 
                     double indexd = nvalue(rc);
-                    int index = int(indexd);
+                    int index = luai_numtoint(indexd);
 
                     // index has to be an exact integer and in-bounds for the array portion
                     if (LUAU_LIKELY(unsigned(index) - 1 < unsigned(h->sizearray) && !h->metatable && !h->readonly && double(index) == indexd))

@@ -1494,8 +1494,9 @@ struct Compiler
             Constant fc = getConstant(expr->args.data[1]);
             Constant wc = getConstant(expr->args.data[2]);
 
-            int fi = fc.type == Constant::Type_Number ? int(fc.valueNumber) : -1;
-            int wi = wc.type == Constant::Type_Number ? int(wc.valueNumber) : -1;
+            // values that can't be in range are rejected before the cast, which also keeps fi + wi from overflowing
+            int fi = fc.type == Constant::Type_Number && fc.valueNumber > -1 && fc.valueNumber < 33 ? int(fc.valueNumber) : -1;
+            int wi = wc.type == Constant::Type_Number && wc.valueNumber > -1 && wc.valueNumber < 33 ? int(wc.valueNumber) : -1;
 
             if (fi >= 0 && wi > 0 && fi + wi <= 32)
             {

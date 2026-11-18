@@ -236,7 +236,7 @@ int luaB_inext(lua_State* L)
 {
     int i = luaL_checkinteger(L, 2);
     luaL_checktype(L, 1, LUA_TTABLE);
-    i++; // next value
+    i = int(unsigned(i) + 1); // next value; wraps around at INT_MAX like the int arithmetic did, without signed overflow
     lua_pushinteger(L, i);
     lua_rawgeti(L, 1, i);
     return (lua_isnil(L, -1)) ? 0 : 2;

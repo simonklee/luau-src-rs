@@ -6,6 +6,7 @@
 
 #include <array>
 #include <limits>
+#include <limits.h>
 #include <math.h>
 
 namespace Luau
@@ -136,10 +137,17 @@ static Constant ctypeof(const Constant& c)
     }
 }
 
+// values out of the int range (and NaN) convert to INT_MIN like they do at runtime, avoiding undefined behavior of the cast
+static int toint(double v)
+{
+    return fabs(v) < 2147483648.0 ? int(v) : INT_MIN;
+}
+
 static uint32_t bit32(double v)
 {
     // convert through signed 64-bit integer to match runtime behavior and gracefully truncate negative integers
-    return uint32_t(int64_t(v));
+    // values out of the 64-bit range (and NaN) convert to 0 like they do at runtime, avoiding undefined behavior of the cast
+    return fabs(v) < 9223372036854775808.0 ? uint32_t(int64_t(v)) : 0;
 }
 
 Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, size_t count, bool vectorDoublePrecision)
@@ -210,7 +218,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
 
     case LBF_MATH_LDEXP:
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
-            return cnum(ldexp(args[0].valueNumber, int(args[1].valueNumber)));
+            return cnum(ldexp(args[0].valueNumber, toint(args[1].valueNumber)));
         break;
 
     case LBF_MATH_LOG10:
@@ -311,7 +319,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int s = int(args[1].valueNumber);
+            int s = toint(args[1].valueNumber);
 
             if (unsigned(s) < 32)
                 return cnum(double(uint32_t(int32_t(u) >> s)));
@@ -396,10 +404,10 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
             (count == 2 || args[2].type == Constant::Type_Number))
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int f = int(args[1].valueNumber);
-            int w = count == 2 ? 1 : int(args[2].valueNumber);
+            int f = toint(args[1].valueNumber);
+            int w = count == 2 ? 1 : toint(args[2].valueNumber);
 
-            if (f >= 0 && w > 0 && f + w <= 32)
+            if (f >= 0 && w > 0 && f <= 32 - w)
             {
                 uint32_t m = ~(0xfffffffeu << (w - 1));
 
@@ -412,9 +420,9 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int s = int(args[1].valueNumber);
+            int s = toint(args[1].valueNumber);
 
-            return cnum(double((u << (s & 31)) | (u >> ((32 - s) & 31))));
+            return cnum(double((u << (s & 31)) | (u >> ((32 - (s & 31)) & 31))));
         }
         break;
 
@@ -422,7 +430,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int s = int(args[1].valueNumber);
+            int s = toint(args[1].valueNumber);
 
             if (unsigned(s) < 32)
                 return cnum(double(u << s));
@@ -435,10 +443,10 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         {
             uint32_t n = bit32(args[0].valueNumber);
             uint32_t v = bit32(args[1].valueNumber);
-            int f = int(args[2].valueNumber);
-            int w = count == 3 ? 1 : int(args[3].valueNumber);
+            int f = toint(args[2].valueNumber);
+            int w = count == 3 ? 1 : toint(args[3].valueNumber);
 
-            if (f >= 0 && w > 0 && f + w <= 32)
+            if (f >= 0 && w > 0 && f <= 32 - w)
             {
                 uint32_t m = ~(0xfffffffeu << (w - 1));
 
@@ -451,9 +459,9 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int s = int(args[1].valueNumber);
+            int s = toint(args[1].valueNumber);
 
-            return cnum(double((u >> (s & 31)) | (u << ((32 - s) & 31))));
+            return cnum(double((u >> (s & 31)) | (u << ((32 - (s & 31)) & 31))));
         }
         break;
 
@@ -461,7 +469,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         if (count == 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             uint32_t u = bit32(args[0].valueNumber);
-            int s = int(args[1].valueNumber);
+            int s = toint(args[1].valueNumber);
 
             if (unsigned(s) < 32)
                 return cnum(double(u >> s));
@@ -481,7 +489,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
         }
         else if (count == 2 && args[0].type == Constant::Type_String && args[1].type == Constant::Type_Number)
         {
-            int i = int(args[1].valueNumber);
+            int i = toint(args[1].valueNumber);
 
             if (i > 0 && unsigned(i) <= args[0].stringLength)
                 return cnum(double(uint8_t(args[0].valueString[i - 1])));
@@ -498,7 +506,7 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
                 if (args[i].type != Constant::Type_Number)
                     return cvar();
 
-                int ch = int(args[i].valueNumber);
+                int ch = toint(args[i].valueNumber);
 
                 if ((unsigned char)(ch) != ch)
                     return cvar();
@@ -533,8 +541,8 @@ Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, 
             const char* str = args[0].valueString;
             unsigned len = args[0].stringLength;
 
-            int start = int(args[1].valueNumber);
-            int end = count >= 3 ? int(args[2].valueNumber) : int(len);
+            int start = toint(args[1].valueNumber);
+            int end = count >= 3 ? toint(args[2].valueNumber) : int(len);
 
             // Relative string position: negative means back from end
             if (start < 0)

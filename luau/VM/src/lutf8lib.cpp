@@ -42,8 +42,10 @@ static const char* utf8_decode(const char* o, int* val)
             res = (res << 6) | (cc & 0x3F); // add lower 6 bits from cont. byte
             c <<= 1;                        // to test next bit
         }
+        if (count > 3)
+            return NULL;                    // invalid byte sequence (checked first, as the shift below is only defined up to 3)
         res |= ((c & 0x7F) << (count * 5)); // add first byte
-        if (count > 3 || res > MAXUNICODE || res <= limits[count])
+        if (res > MAXUNICODE || res <= limits[count])
             return NULL; // invalid byte sequence
         if (unsigned(res - 0xD800) < 0x800)
             return NULL; // surrogate
@@ -241,7 +243,7 @@ static int iter_aux(lua_State* L)
 {
     size_t len;
     const char* s = luaL_checklstring(L, 1, &len);
-    int n = lua_tointeger(L, 2) - 1;
+    int n = int(unsigned(lua_tointeger(L, 2)) - 1); // wraps around at INT_MIN like the int arithmetic did, without signed overflow
     if (n < 0) // first iteration?
         n = 0; // start from here
     else if (n < (int)len)

@@ -648,10 +648,10 @@ static BuiltinImplResult translateBuiltinBit32Extract(IrBuilder& build, int npar
         IrOp w = build.inst(IrCmd::NUM_TO_INT, vc);
         IrOp fw = build.inst(IrCmd::ADD_INT, f, w);
 
-        // f >= 0 && w > 0 && f + w <= 32
+        // f >= 0 && w > 0 && f + w <= 32; the sum is compared unsigned, as f + w of two non-negative ints can exceed INT_MAX but not UINT_MAX
         build.inst(IrCmd::CHECK_CMP_INT, f, build.constInt(0), build.cond(IrCondition::GreaterEqual), build.vmExit(pcpos));
         build.inst(IrCmd::CHECK_CMP_INT, w, build.constInt(0), build.cond(IrCondition::Greater), build.vmExit(pcpos));
-        build.inst(IrCmd::CHECK_CMP_INT, fw, build.constInt(32), build.cond(IrCondition::LessEqual), build.vmExit(pcpos));
+        build.inst(IrCmd::CHECK_CMP_INT, fw, build.constInt(32), build.cond(IrCondition::UnsignedLessEqual), build.vmExit(pcpos));
 
         IrOp shift = build.inst(IrCmd::BITLSHIFT_UINT, build.constInt(0xfffffffe), build.inst(IrCmd::SUB_INT, w, build.constInt(1)));
         IrOp m = build.inst(IrCmd::BITNOT_UINT, shift);
@@ -766,10 +766,10 @@ static BuiltinImplResult translateBuiltinBit32Replace(IrBuilder& build, int npar
         IrOp w = build.inst(IrCmd::NUM_TO_INT, vd);
         IrOp fw = build.inst(IrCmd::ADD_INT, f, w);
 
-        // f >= 0 && w > 0 && f + w <= 32
+        // f >= 0 && w > 0 && f + w <= 32; the sum is compared unsigned, as f + w of two non-negative ints can exceed INT_MAX but not UINT_MAX
         build.inst(IrCmd::CHECK_CMP_INT, f, build.constInt(0), build.cond(IrCondition::GreaterEqual), build.vmExit(pcpos));
         build.inst(IrCmd::CHECK_CMP_INT, w, build.constInt(0), build.cond(IrCondition::Greater), build.vmExit(pcpos));
-        build.inst(IrCmd::CHECK_CMP_INT, fw, build.constInt(32), build.cond(IrCondition::LessEqual), build.vmExit(pcpos));
+        build.inst(IrCmd::CHECK_CMP_INT, fw, build.constInt(32), build.cond(IrCondition::UnsignedLessEqual), build.vmExit(pcpos));
 
         IrOp shift1 = build.inst(IrCmd::BITLSHIFT_UINT, build.constInt(0xfffffffe), build.inst(IrCmd::SUB_INT, w, build.constInt(1)));
         IrOp m = build.inst(IrCmd::BITNOT_UINT, shift1);

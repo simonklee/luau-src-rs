@@ -11,6 +11,7 @@
 LUAU_FASTFLAG(LuauBufferCage)
 LUAU_FASTFLAGVARIABLE(LuauBufferSweep)
 LUAU_FASTFLAGVARIABLE(LuauCageSplitData)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauSmallPages, true)
 
 /*
  * Luau heap uses a size-segregated page structure, with individual pages and large allocations
@@ -74,6 +75,9 @@ LUAU_FASTFLAGVARIABLE(LuauCageSplitData)
  * In both cases, we pick the page by computing the size class from the block size which rounds the block
  * size up to reduce the chance that we'll allocate pages that have very few allocated blocks. The size
  * class strategy is determined by SizeClassConfig constructor.
+ *
+ * With LuauSmallPages, pages are smaller while the heap is small (1K to 16K, by classpagesize); each page
+ * records its own size, which freeing and page walks use.
  *
  * Note that when the last block in a page is freed, we immediately free the page with frealloc - the
  * memory manager doesn't currently attempt to keep unused memory around. This can result in excessive
@@ -148,6 +152,11 @@ const size_t kExternalAllocatorMetaDataReduction = 24;
 
 const size_t kSmallPageSize = 16 * 1024 - kExternalAllocatorMetaDataReduction;
 const size_t kLargePageSize = 32 * 1024 - kExternalAllocatorMetaDataReduction;
+
+// with LuauSmallPages, pages grow with the heap: a new page is at least 1/kSmallPageHeapRatio of the heap, rounded up to a
+// power of two from kMinPageSize to 16 KB (twice that for blocks over kLargePageThreshold, less the reduction above)
+const size_t kMinPageSize = 1024;
+const size_t kSmallPageHeapRatio = 64;
 
 const size_t kBlockHeader = sizeof(double) > sizeof(void*) ? sizeof(double) : sizeof(void*); // suitable for aligning double & void* on all platforms
 const size_t kGCOLinkOffset = (sizeof(GCheader) + sizeof(void*) - 1) & ~(sizeof(void*) - 1); // GCO pages contain freelist links after the GC header
@@ -373,6 +382,26 @@ static lua_Page* newpage(lua_State* L, lua_Page** pageset, int pageSize, int blo
     return page;
 }
 
+// a small heap, such as an idle VM's, would otherwise hold a mostly empty 16 KB page for each size class in use
+static int classpagesize(global_State* g, int sizeOfClass)
+{
+    static_assert(kMinPageSize - kExternalAllocatorMetaDataReduction - offsetof(lua_Page, data) >= kLargePageThreshold + kBlockHeader, "page too small");
+    static_assert(kMinPageSize * 2 - kExternalAllocatorMetaDataReduction - offsetof(lua_Page, data) >= kMaxSmallSize + kBlockHeader, "page too small");
+
+    bool large = sizeOfClass > int(kLargePageThreshold);
+
+    if (!DFFlag::LuauSmallPages)
+        return int(large ? kLargePageSize : kSmallPageSize);
+
+    size_t size = kMinPageSize;
+
+    while (size < kSmallPageSize && size * kSmallPageHeapRatio < g->totalbytes)
+        size *= 2;
+
+    // at 16 KB, this is kSmallPageSize or kLargePageSize
+    return int((large ? size * 2 : size) - kExternalAllocatorMetaDataReduction);
+}
+
 // this is part of a cold path in newblock and newgcoblock
 // it is marked as noinline to prevent it from being inlined into those functions
 // if it is inlined, then the compiler may determine those functions are "too big" to be profitably inlined, which results in reduced performance
@@ -380,7 +409,7 @@ template<AllocationPath path, int type, bool nothrow>
 LUAU_NOINLINE static lua_Page* newclasspage(lua_State* L, lua_Page** freepageset, lua_Page** pageset, uint8_t sizeClass, bool storeMetadata)
 {
     int sizeOfClass = kSizeClassConfig.sizeOfClass[sizeClass];
-    int pageSize = sizeOfClass > int(kLargePageThreshold) ? kLargePageSize : kSmallPageSize;
+    int pageSize = classpagesize(L->global, sizeOfClass);
     int blockSize = sizeOfClass + (storeMetadata ? kBlockHeader : 0);
     int blockCount = (pageSize - offsetof(lua_Page, data)) / blockSize;
 
