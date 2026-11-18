@@ -12,6 +12,31 @@
 #include "lvm.h"
 
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableFindImprovement, false)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableSortInterrupt, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableFindInterrupt, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableMoveBudget, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableForeachInterrupt, true)
+
+// calls the interrupt from a library function that runs no bytecode for a while; the interrupt can't yield there
+LUAU_NOINLINE static void tablib_interrupt(lua_State* L)
+{
+    void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
+
+    if (interrupt)
+    {
+        L->nCcalls++;
+        interrupt(L, -1);
+        L->nCcalls--;
+    }
+}
+
+// a callback written in C runs no bytecode, and may itself call table.foreach with a C callback, and so on; with
+// LuauTableForeachInterrupt, foreach and foreachi call the interrupt after each call of one
+static void foreach_interrupt(lua_State* L)
+{
+    if (DFFlag::LuauTableForeachInterrupt && clvalue(&L->base[1])->isC)
+        tablib_interrupt(L);
+}
 
 static int foreachi(lua_State* L)
 {
@@ -25,6 +50,7 @@ static int foreachi(lua_State* L)
         lua_pushinteger(L, i); // 1st argument
         lua_rawgeti(L, 1, i);  // 2nd argument
         lua_call(L, 2, 1);
+        foreach_interrupt(L);
         if (!lua_isnil(L, -1))
             return 1;
         lua_pop(L, 1); // remove nil result
@@ -43,6 +69,7 @@ static int foreach (lua_State* L)
         lua_pushvalue(L, -3); // key
         lua_pushvalue(L, -3); // value
         lua_call(L, 2, 1);
+        foreach_interrupt(L);
         if (!lua_isnil(L, -1))
             return 1;
         lua_pop(L, 2); // remove value and result
@@ -111,6 +138,38 @@ static bool tovalidintkey(lua_State* L, int idx, int f, int e, int* result)
     }
 
     return false;
+}
+
+// with LuauTableMoveBudget, a move that goes element by element calls the interrupt after each this many elements
+const int kMoveInterruptElements = 1024;
+
+// moveelements' element by element move of n elements, with LuauTableMoveBudget; backward moves the last one first
+LUAU_NOINLINE static void movebudget(lua_State* L, int srct, int dstt, LuaTable* dst, int f, int t, int n, bool backward)
+{
+    int step = backward ? -1 : 1;
+    int budget = kMoveInterruptElements;
+
+    for (int k = 0, i = backward ? n - 1 : 0; k < n; ++k, i += step)
+    {
+        if (LUAU_UNLIKELY(budget-- == 0))
+        {
+            budget = kMoveInterruptElements - 1;
+            tablib_interrupt(L);
+
+            // the interrupt may freeze the destination, and the move must not write to it after that
+            if (dst->readonly)
+                luaG_readonlyerror(L);
+        }
+
+        lua_rawgeti(L, srct, f + i);
+
+        // writing nil to an absent key would add a node for it, and a table whose free nodes run out rehashes on each
+        // such write without growing, since nil values don't count towards its size
+        if (ttisnil(L->top - 1) && ttisnil(luaH_getnum(dst, t + i)))
+            L->top--;
+        else
+            lua_rawseti(L, dstt, t + i);
+    }
 }
 
 static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t, bool sparsemove)
@@ -194,6 +253,10 @@ static void moveelements(lua_State* L, int srct, int dstt, int f, int e, int t, 
         }
 
         lua_pop(L, 1);
+    }
+    else if (DFFlag::LuauTableMoveBudget)
+    {
+        movebudget(L, srct, dstt, dst, f, t, n, /* backward */ !(t > e || t <= f || dst != src));
     }
     else
     {
@@ -394,6 +457,26 @@ static int tunpack(lua_State* L)
 
 typedef int (*SortPredicate)(lua_State* L, const TValue* l, const TValue* r);
 
+// with LuauTableSortInterrupt, a sort calls the interrupt for bounded work, since it may run no bytecode for a long time:
+// once for each kSortInterruptElements elements it partitions (counting only ranges of kSortInterruptRange or more), each
+// time heap sort has placed kSortInterruptPlacements elements, for each kSortInterruptBytes bytes of strings it compares,
+// and after each call of a comparator or metamethod written in C
+const int kSortInterruptElements = 1024;
+const int kSortInterruptRange = 256;
+const int kSortInterruptPlacements = 16;
+const int kSortInterruptBytes = 65536;
+
+// strings that share a first byte and are both this long or longer are compared in slices and charged by the bytes
+// compared; shorter ones cost little more than a comparison of numbers
+const size_t kSortStringCharged = 256;
+
+// a callback may freeze the table being sorted, and the sort must not write to it after that
+static void sort_checkreadonly(lua_State* L)
+{
+    if (hvalue(L->base)->readonly)
+        luaG_readonlyerror(L);
+}
+
 static int sort_func(lua_State* L, const TValue* l, const TValue* r)
 {
     LUAU_ASSERT(L->top == L->base + 2); // table, function
@@ -405,7 +488,109 @@ static int sort_func(lua_State* L, const TValue* l, const TValue* r)
     luaD_call(L, L->top - 3, 1);
     L->top -= 1; // maintain stack depth
 
-    return !l_isfalse(L->top);
+    int res = !l_isfalse(L->top);
+
+    if (DFFlag::LuauTableSortInterrupt)
+    {
+        // a comparator written in Luau reaches the interrupt through its own safepoints
+        if (clvalue(&L->base[1])->isC)
+            tablib_interrupt(L);
+
+        sort_checkreadonly(L);
+    }
+
+    return res;
+}
+
+// without a comparator, the sort's slot for it holds the bytes of strings compared since the last interrupt; the strings
+// being compared stay alive while the interrupt runs, since it may change the table
+static void sort_chargebytes(lua_State* L, TString* ls, TString* rs, size_t bytes)
+{
+    double total = nvalue(&L->base[1]) + double(bytes);
+
+    if (total >= kSortInterruptBytes)
+    {
+        total -= kSortInterruptBytes;
+
+        setsvalue(L, L->top, ls);
+        setsvalue(L, L->top + 1, rs);
+        L->top += 2; // safe because of LUA_MINSTACK guarantee
+        tablib_interrupt(L);
+        L->top -= 2;
+
+        sort_checkreadonly(L);
+    }
+
+    setnvalue(&L->base[1], total); // the interrupt may reallocate the stack
+}
+
+// luaV_strcmp for strings that share a first byte and are both long: compares slices that grow up to half the
+// interrupt's share of bytes, and charges each one
+LUAU_NOINLINE static int sort_strcmp(lua_State* L, TString* ls, TString* rs)
+{
+    size_t ll = ls->len;
+    size_t lr = rs->len;
+    size_t lmin = ll < lr ? ll : lr;
+
+    int res = 0;
+    size_t slice = kSortStringCharged;
+
+    for (size_t pos = 0; pos < lmin && res == 0; pos += slice, slice = slice < kSortInterruptBytes / 2 ? slice * 2 : slice)
+    {
+        size_t len = lmin - pos < slice ? lmin - pos : slice;
+        res = memcmp(getstr(ls) + pos, getstr(rs) + pos, len);
+        sort_chargebytes(L, ls, rs, len);
+    }
+
+    if (res != 0)
+        return res;
+
+    return ll == lr ? 0 : ll < lr ? -1 : 1;
+}
+
+// luaV_strcmp(ls, rs) < 0, apart from strings that share a first byte and are both long
+LUAU_NOINLINE static int sort_strlessthan(lua_State* L, TString* ls, TString* rs)
+{
+    if (ls == rs)
+        return 0;
+
+    const char* lp = getstr(ls);
+    const char* rp = getstr(rs);
+
+    // always safe to read one character because even empty strings are nul terminated
+    if (*lp != *rp)
+        return uint8_t(*lp) < uint8_t(*rp);
+
+    size_t lmin = ls->len < rs->len ? ls->len : rs->len;
+
+    if (LUAU_UNLIKELY(lmin >= kSortStringCharged))
+        return sort_strcmp(L, ls, rs) < 0;
+
+    int res = memcmp(lp, rp, lmin);
+    return res != 0 ? res < 0 : ls->len < rs->len;
+}
+
+// other types either raise an error or call a metamethod, which may be written in C and run no bytecode
+LUAU_NOINLINE static int sort_metalessthan(lua_State* L, const TValue* l, const TValue* r)
+{
+    int res = luaV_lessthan(L, l, r);
+
+    tablib_interrupt(L);
+    sort_checkreadonly(L);
+
+    return res;
+}
+
+// luaV_lessthan with bounded work between interrupts
+static int sort_lessthan(lua_State* L, const TValue* l, const TValue* r)
+{
+    if (LUAU_LIKELY(ttisnumber(l) && ttisnumber(r)))
+        return luai_numlt(nvalue(l), nvalue(r));
+
+    if (ttisstring(l) && ttisstring(r))
+        return sort_strlessthan(L, tsvalue(l), tsvalue(r));
+
+    return sort_metalessthan(L, l, r);
 }
 
 inline void sort_swap(lua_State* L, LuaTable* t, int i, int j)
@@ -434,6 +619,24 @@ inline int sort_less(lua_State* L, LuaTable* t, int i, int j, SortPredicate pred
         luaL_error(L, "table modified during sorting");
 
     return res;
+}
+
+// calls the interrupt for work the sort did without one, when there's no comparator
+LUAU_NOINLINE static void sort_interrupt(lua_State* L, LuaTable* t, SortPredicate pred, int calls)
+{
+    if (pred != sort_lessthan)
+        return;
+
+    int n = t->sizearray;
+
+    for (int i = 0; i < calls; ++i)
+        tablib_interrupt(L);
+
+    // interrupt call may resize the table, which is invalid
+    if (t->sizearray != n)
+        luaL_error(L, "table modified during sorting");
+
+    sort_checkreadonly(L);
 }
 
 static void sort_siftheap(lua_State* L, LuaTable* t, int l, int u, SortPredicate pred, int root)
@@ -468,10 +671,18 @@ static void sort_heap(lua_State* L, LuaTable* t, int l, int u, SortPredicate pre
     int count = u - l + 1;
 
     for (int i = count / 2 - 1; i >= 0; --i)
+    {
+        if (i % kSortInterruptPlacements == 0)
+            sort_interrupt(L, t, pred, 1);
+
         sort_siftheap(L, t, l, u, pred, i);
+    }
 
     for (int i = count - 1; i > 0; --i)
     {
+        if (i % kSortInterruptPlacements == 0)
+            sort_interrupt(L, t, pred, 1);
+
         sort_swap(L, t, l, l + i);
         sort_siftheap(L, t, l, l + i - 1, pred, 0);
     }
@@ -529,6 +740,11 @@ static void sort_rec(lua_State* L, LuaTable* t, int l, int u, int limit, SortPre
         // swap pivot a[p] with a[i], which is the new midpoint
         sort_swap(L, t, p, i);
 
+        // the work between two interrupts is at most one partition and the sorting of two ranges smaller than
+        // kSortInterruptRange, apart from the work string comparisons and metamethods charge themselves
+        if (u - l + 1 >= kSortInterruptRange)
+            sort_interrupt(L, t, pred, (u - l + kSortInterruptElements) / kSortInterruptElements);
+
         // adjust limit to allow 1.5 log2N recursive steps
         limit = (limit >> 1) + (limit >> 2);
 
@@ -555,13 +771,16 @@ static int tsort(lua_State* L)
     if (t->readonly)
         luaG_readonlyerror(L);
 
-    SortPredicate pred = luaV_lessthan;
+    SortPredicate pred = DFFlag::LuauTableSortInterrupt ? sort_lessthan : luaV_lessthan;
     if (!lua_isnoneornil(L, 2)) // is there a 2nd argument?
     {
         luaL_checktype(L, 2, LUA_TFUNCTION);
         pred = sort_func;
     }
     lua_settop(L, 2); // make sure there are two arguments
+
+    if (pred == sort_lessthan)
+        setnvalue(&L->base[1], 0); // bytes of strings compared since the last interrupt; see sort_chargebytes
 
     if (n > 0)
         sort_rec(L, t, 0, n - 1, n, pred);
@@ -592,6 +811,38 @@ static int tcreate(lua_State* L)
         lua_createtable(L, size, 0);
     }
 
+    return 1;
+}
+
+// tfind's search with LuauTableFindInterrupt for a value with an __eq metamethod, which may be written in C and run no
+// bytecode, or from an index close enough to INT_MAX for the next one to overflow: calls the interrupt after each
+// comparison that may call __eq, and stops after INT_MAX
+LUAU_NOINLINE static int findguarded(lua_State* L, LuaTable* t, int init)
+{
+    for (int i = init;; ++i)
+    {
+        const TValue* e = luaH_getnum(t, i);
+        if (ttisnil(e))
+            break;
+
+        StkId v = L->base + 1;
+        bool call = ttype(e) == ttype(v);
+        bool found = equalobj(L, v, e);
+
+        if (call)
+            tablib_interrupt(L);
+
+        if (found)
+        {
+            lua_pushinteger(L, i);
+            return 1;
+        }
+
+        if (i == INT_MAX)
+            break;
+    }
+
+    lua_pushnil(L);
     return 1;
 }
 
@@ -641,6 +892,13 @@ static int tfind(lua_State* L)
             return 1;
         }
     }
+
+    // only the value's __eq can be called, and nothing else runs if it has none; then the table doesn't change, and the
+    // search goes through at most as many indices as the table has room for, so the next one can't overflow unless init
+    // is that close to INT_MAX
+    if (DFFlag::LuauTableFindInterrupt && ((iscollectable(L->base + 1) && !ttisnil(luaT_gettmbyobj(L, L->base + 1, TM_EQ))) ||
+                                              init > INT_MAX - t->sizearray - sizenode(t)))
+        return findguarded(L, t, init);
 
     for (int i = init;; ++i)
     {

@@ -1534,6 +1534,28 @@ int lua_gc(lua_State* L, int what, int data)
         res = g->gcstate == GCSpause;
         break;
     }
+    case LUA_GCSETGOALLARGE:
+    {
+        // kept within [0%, 1000%]; at 1000%, as with LUA_GCSETGOAL, the pacer's error terms stay in range for heaps
+        // up to about 7 GB
+        res = g->gcgoallarge;
+        g->gcgoallarge = data < 0 ? 0 : data > 1000 ? 1000 : data;
+        break;
+    }
+    case LUA_GCSETSTEPMULLARGE:
+    {
+        // kept within [1%, 10000%]
+        res = g->gcstepmullarge;
+        g->gcstepmullarge = data < 1 ? 1 : data > 10000 ? 10000 : data;
+        break;
+    }
+    case LUA_GCSETGOALTHRESHOLD:
+    {
+        // the threshold is expressed in Kbytes, as LUA_GCCOUNT; 0 or less unsets it
+        res = g->gcgoalthreshold == SIZE_MAX ? 0 : int(g->gcgoalthreshold);
+        g->gcgoalthreshold = data <= 0 ? SIZE_MAX : size_t(data);
+        break;
+    }
     default:
         res = -1; // invalid option
     }

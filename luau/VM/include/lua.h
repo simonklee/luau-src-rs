@@ -333,6 +333,8 @@ enum lua_GCOp
     ** - for G=200%, S should be in the interval [150%, 200%]
     ** - for G=150%, S should be in the interval [200%, 300%]
     ** - for G=125%, S should be in the interval [400%, 500%]
+    **
+    ** G can also depend on the heap size: see LUA_GCSETGOALLARGE below.
     */
     LUA_GCSETGOAL,
     LUA_GCSETSTEPMUL,
@@ -340,6 +342,26 @@ enum lua_GCOp
 
     // return 1 if GC is in a paused state; making a GC step in a paused state will unpause the GC
     LUA_GCISPAUSED,
+
+    /*
+    ** set a second goal GL and step multiplier SL (in percentages, as G and S), and the heap size T (in KB, as
+    ** LUA_GCCOUNT) from which they replace G and S
+    **
+    ** this lets a host with a fixed memory limit keep a cheap goal for small heaps and a tight one for large heaps,
+    ** which leaves more room for garbage before the limit is reached; for example, G=200%, GL=115%, SL=1600%, T=8192.
+    ** choose SL for GL as S for G, from the examples above: at a lower SL the collector may not reach GL.
+    **
+    ** the goal is chosen when a collection cycle ends (incremental or full): GL if the heap is T or larger at that point,
+    ** G otherwise; below T, the heap may not grow past what GL allows a heap of size T, so the heap allowed never drops
+    ** as the heap grows. the step multiplier is chosen at each step, by the same rule.
+    **
+    ** T of 0 or less unsets the threshold (the default), which leaves only G and S in use; GL and SL default to 200%.
+    ** GL is kept within [0%, 1000%] and SL within [1%, 10000%]; each option returns the previous value it kept (0 for
+    ** an unset threshold). neither goal is a hard memory limit.
+    */
+    LUA_GCSETGOALLARGE,
+    LUA_GCSETGOALTHRESHOLD,
+    LUA_GCSETSTEPMULLARGE,
 };
 
 LUA_API int lua_gc(lua_State* L, int what, int data);

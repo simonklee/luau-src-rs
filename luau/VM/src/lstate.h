@@ -228,6 +228,10 @@ typedef struct global_State
     int gcstepmul;                            // see LUAI_GCSTEPMUL
     int gcstepsize;                           // see LUAI_GCSTEPSIZE
 
+    int gcgoallarge;                          // goal used instead of gcgoal once totalbytes >= gcgoalthreshold
+    int gcstepmullarge;                       // step multiplier used instead of gcstepmul once totalbytes >= gcgoalthreshold
+    size_t gcgoalthreshold;                   // in KB; SIZE_MAX when unset
+
     struct lua_Page* freepages[LUA_SIZECLASSES]; // free page linked list for each size class for non-collectable objects
     struct lua_Page* freegcopages[LUA_SIZECLASSES]; // free page linked list for each size class for collectable objects
     struct lua_Page* allpages; // page linked list with all pages for all non-collectable object classes (available with LUAU_ASSERTENABLED)

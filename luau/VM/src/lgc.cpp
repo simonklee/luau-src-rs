@@ -22,6 +22,7 @@ LUAU_FASTFLAGVARIABLE(LuauGcTraceUdata)
 LUAU_FLAGVERSION(LuauGcTraceUdata, 5)
 LUAU_FASTFLAG(LuauCoroutineFinally)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcHeapShrinkFix, false)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcGoalByHeap, true)
 LUAU_FASTFLAGVARIABLE(LuauRuntimeFeedback)
 LUAU_FLAGVERSION(LuauRuntimeFeedback, 2)
 LUAU_FASTFLAG(LuauBufferSweep)
@@ -1400,6 +1401,84 @@ static size_t getheapgrowth(size_t current, size_t previous)
     return current > previous ? current - previous : 0;
 }
 
+// the heap has reached the threshold (in KB) of the large goal and step multiplier
+static bool islargeheap(global_State* g)
+{
+    return DFFlag::LuauGcGoalByHeap && (g->totalbytes >> 10) >= g->gcgoalthreshold;
+}
+
+// the goal for the cycle that starts now
+static int getgcgoal(global_State* g)
+{
+    return islargeheap(g) ? g->gcgoallarge : g->gcgoal;
+}
+
+// the step multiplier at this point of a step
+static int getgcstepmul(global_State* g)
+{
+    return islargeheap(g) ? g->gcstepmullarge : g->gcstepmul;
+}
+
+// heap sizes the pacer computes saturate here: below SIZE_MAX, which stands for a stopped collector, and well within
+// the int64_t that getheaptrigger subtracts in
+static const size_t kHeapLimit = sizeof(size_t) < sizeof(int64_t) ? SIZE_MAX - 1 : size_t(INT64_MAX / 2);
+
+// a * b / c rounded down, exactly, saturated at kHeapLimit; c must not be 0
+static size_t muldiv(uint64_t a, uint64_t b, uint64_t c)
+{
+    // a * (b / c) + (a / c) * (b % c) + (a % c) * (b % c) / c: only the first term can overflow
+    uint64_t bq = b / c;
+    uint64_t br = b % c;
+
+    if (bq != 0 && a > kHeapLimit / bq)
+        return kHeapLimit;
+
+    uint64_t r = a * bq;
+    uint64_t rest = (a / c) * br + (a % c) * br / c;
+
+    return rest >= kHeapLimit - r ? kHeapLimit : size_t(r + rest);
+}
+
+// the heap goal for a goal in percent; a goal of 0 or less gives 0
+size_t luaC_heapgoal(uint64_t totalbytes, int goal)
+{
+    if (goal <= 0)
+        return 0;
+
+    uint64_t base = totalbytes / 100;
+
+    return base <= kHeapLimit / uint64_t(goal) ? size_t(base * goal) : kHeapLimit;
+}
+
+// the trigger after a full collection, which reaches the goal at the step multiplier's pace; never below the heap
+size_t luaC_fullgcthreshold(size_t totalbytes, int goal, int stepmul)
+{
+    // goal and stepmul are defined in percents
+    int64_t factor = int64_t(goal) * stepmul / 100 - 100;
+
+    if (stepmul <= 0 || factor <= stepmul)
+        return totalbytes;
+
+    return muldiv(totalbytes, uint64_t(factor), uint64_t(stepmul));
+}
+
+// the heap goal for the cycle that starts now, at the goal getgcgoal chose; with a threshold set, the large goal of a
+// heap at the threshold caps the goals below it, so that the heap goal never drops as the heap grows
+static size_t getheapgoal(global_State* g, int goal)
+{
+    size_t heapgoal = luaC_heapgoal(g->totalbytes, goal);
+
+    if (DFFlag::LuauGcGoalByHeap && g->gcgoalthreshold != SIZE_MAX && !islargeheap(g))
+    {
+        size_t cap = luaC_heapgoal(uint64_t(g->gcgoalthreshold) << 10, g->gcgoallarge);
+
+        if (heapgoal > cap)
+            heapgoal = cap;
+    }
+
+    return heapgoal;
+}
+
 static size_t getheaptrigger(global_State* g, size_t heapgoal)
 {
     // adjust threshold based on a guess of how many bytes will be allocated between the cycle start and sweep phase
@@ -1418,9 +1497,12 @@ static size_t getheaptrigger(global_State* g, size_t heapgoal)
         allocationrate = (g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / allocationduration;
     double markduration = g->gcstats.atomicstarttimestamp - g->gcstats.starttimestamp;
 
-    int64_t expectedgrowth = int64_t(markduration * allocationrate);
+    // saturate the growth: with LuauGcHeapShrinkFix off, a heap that shrank reads as a huge growth
+    double growth = markduration * allocationrate;
+    int64_t limit = int64_t(kHeapLimit);
+    int64_t expectedgrowth = growth >= double(limit) ? limit : growth <= -double(limit) ? -limit : int64_t(growth);
     int64_t offset = getheaptriggererroroffset(g);
-    int64_t heaptrigger = heapgoal - (expectedgrowth + offset);
+    int64_t heaptrigger = int64_t(heapgoal) - (expectedgrowth + offset);
 
     // clamp the trigger between memory use at the end of the cycle and the heap goal
     return heaptrigger < int64_t(g->totalbytes) ? g->totalbytes : (heaptrigger > int64_t(heapgoal) ? heapgoal : size_t(heaptrigger));
@@ -1433,7 +1515,7 @@ size_t luaC_step(lua_State* L, bool assist)
     if (g->gcdisabled != 0)
         return 0;
 
-    size_t lim = g->gcstepsize * g->gcstepmul / 100; // how much to work
+    size_t lim = muldiv(g->gcstepsize, getgcstepmul(g), 100); // how much to work
     LUAU_ASSERT(g->totalbytes >= g->GCthreshold);
     size_t debt = g->totalbytes - g->GCthreshold;
 
@@ -1453,7 +1535,7 @@ size_t luaC_step(lua_State* L, bool assist)
     // if allocations outpace the GC to require an assist, adjust step size to cover the difference
     if (assist)
     {
-        size_t need = debt * g->gcstepmul / 100;
+        size_t need = muldiv(debt, getgcstepmul(g), 100);
 
         if (need > lim)
             lim = need;
@@ -1467,13 +1549,13 @@ size_t luaC_step(lua_State* L, bool assist)
     recordGcStateStep(g, lastgcstate, lua_clock() - lasttimestamp, assist, work);
 #endif
 
-    size_t actualstepsize = work * 100 / g->gcstepmul;
+    size_t actualstepsize = muldiv(work, 100, getgcstepmul(g));
 
     // at the end of the last cycle
     if (g->gcstate == GCSpause)
     {
-        // at the end of a collection cycle, set goal based on gcgoal setting
-        size_t heapgoal = (g->totalbytes / 100) * g->gcgoal;
+        // at the end of a collection cycle, set goal based on gcgoal setting (gcgoallarge once the heap reaches gcgoalthreshold)
+        size_t heapgoal = getheapgoal(g, getgcgoal(g));
         size_t heaptrigger = getheaptrigger(g, heapgoal);
 
         g->GCthreshold = heaptrigger;
@@ -1558,14 +1640,27 @@ void luaC_fullgc(lua_State* L)
     // reclaim as much buffer memory as possible (shrinkbuffers() called during sweep is incremental)
     shrinkbuffersfull(L);
 
-    size_t heapgoalsizebytes = (g->totalbytes / 100) * g->gcgoal;
+    int gcgoal = getgcgoal(g);
+    size_t heapgoalsizebytes = getheapgoal(g, gcgoal);
 
     // trigger cannot be correctly adjusted after a forced full GC.
     // we will try to place it so that we can reach the goal based on
     // the rate at which we run the GC relative to allocation rate
     // and on amount of bytes we need to traverse in propagation stage.
     // goal and stepmul are defined in percents
-    g->GCthreshold = g->totalbytes * (g->gcgoal * g->gcstepmul / 100 - 100) / g->gcstepmul;
+    int gcstepmul = getgcstepmul(g);
+
+    if (heapgoalsizebytes < luaC_heapgoal(g->totalbytes, gcgoal))
+    {
+        // a capped heap goal: leave room to mark the heap at the step multiplier's pace before reaching it
+        size_t allowance = muldiv(g->totalbytes, 100, gcstepmul);
+        bool room = heapgoalsizebytes > g->totalbytes && heapgoalsizebytes - g->totalbytes > allowance;
+        g->GCthreshold = room ? heapgoalsizebytes - allowance : g->totalbytes;
+    }
+    else
+    {
+        g->GCthreshold = luaC_fullgcthreshold(g->totalbytes, gcgoal, gcstepmul);
+    }
 
     // but it might be impossible to satisfy that directly
     if (g->GCthreshold < g->totalbytes)

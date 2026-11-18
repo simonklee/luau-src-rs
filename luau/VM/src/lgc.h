@@ -134,6 +134,8 @@
 LUAI_FUNC void luaC_freeall(lua_State* L);
 LUAI_FUNC size_t luaC_step(lua_State* L, bool assist);
 LUAI_FUNC void luaC_fullgc(lua_State* L);
+LUAI_FUNC size_t luaC_heapgoal(uint64_t totalbytes, int goal);
+LUAI_FUNC size_t luaC_fullgcthreshold(size_t totalbytes, int goal, int stepmul);
 LUAI_FUNC void luaC_upvalclosed(lua_State* L, UpVal* uv);
 LUAI_FUNC void luaC_barrierf(lua_State* L, GCObject* o, GCObject* v);
 LUAI_FUNC void luaC_barriertable(lua_State* L, LuaTable* t, GCObject* v);

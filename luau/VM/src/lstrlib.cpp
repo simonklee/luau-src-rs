@@ -12,9 +12,11 @@
 #include <intrin.h>
 #endif
 
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringSplit, false)
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, false)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringSplit, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauOptimizeStringGsub, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLinearStringSearch, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauPatternBudget, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauStringPackInterrupt, true)
 
 // macro to `unsign' a character
 #define uchar(c) ((unsigned char)(c))
@@ -189,7 +191,9 @@ typedef struct MatchState
     const char* src_end;  // end ('\0') of source string
     const char* p_end;    // end ('\0') of pattern
     lua_State* L;
-    int level; // total number of captures (finished or unfinished)
+    bool budget;    // LuauPatternBudget, read once for the call
+    ptrdiff_t work; // with budget, work left before the next interrupt call
+    int level;      // total number of captures (finished or unfinished)
     struct
     {
         const char* init;
@@ -199,6 +203,48 @@ typedef struct MatchState
 
 // recursive function
 static const char* match(MatchState* ms, const char* s, const char* p);
+
+// With LuauPatternBudget, pattern functions charge their work to MatchState::work instead of calling the interrupt at
+// every entry to match(): a unit for each step of match(), a unit for each byte of the subject, of a set or of a
+// back-reference that they scan, a unit for each byte or escape of a replacement, and kMatchCaptureWork and its length
+// for each capture they push. When a charge takes the work left below zero, they call the interrupt and start again from
+// kMatchInterruptWork. So the work between two calls is bounded, and a function call that matches a short subject
+// doesn't call it at all. Without the flag, match() calls the interrupt at every entry, as before, and nothing else
+// does: the charges never reach the interrupt.
+const ptrdiff_t kMatchInterruptWork = 1 << 13;
+
+// a capture is pushed as a string, for a replacement function or table, for %1 in a replacement string, or as a result;
+// that costs about as much as scanning this many bytes, and a unit for each byte of the capture
+const ptrdiff_t kMatchCaptureWork = 32;
+
+static LUAU_NOINLINE void match_interrupt(MatchState* ms)
+{
+    lua_State* L = ms->L;
+    void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
+
+    if (!ms->budget)
+    {
+        ms->work = PTRDIFF_MAX;
+        return;
+    }
+
+    ms->work = kMatchInterruptWork;
+
+    if (interrupt)
+    {
+        // this interrupt is not yieldable
+        L->nCcalls++;
+        interrupt(L, -1);
+        L->nCcalls--;
+    }
+}
+
+static LUAU_FORCEINLINE void match_charge(MatchState* ms, ptrdiff_t units)
+{
+    ms->work -= units;
+    if (LUAU_UNLIKELY(ms->work < 0))
+        match_interrupt(ms);
+}
 
 #define L_ESC '%'
 #define SPECIALS "^$*+?.([%-"
@@ -232,6 +278,7 @@ static const char* classend(MatchState* ms, const char* p)
     }
     case '[':
     {
+        const char* set = p;
         if (*p == '^')
             p++;
         do
@@ -241,6 +288,7 @@ static const char* classend(MatchState* ms, const char* p)
             if (*(p++) == L_ESC && p < ms->p_end)
                 p++; // skip escapes (e.g. `%]')
         } while (*p != ']');
+        match_charge(ms, p - set);
         return p + 1;
     }
     default:
@@ -322,7 +370,7 @@ static int matchbracketclass(int c, const char* p, const char* ec)
     return !sig;
 }
 
-static int singlematch(MatchState* ms, const char* s, const char* p, const char* ep)
+static LUAU_FORCEINLINE int singlematch(MatchState* ms, const char* s, const char* p, const char* ep)
 {
     if (s >= ms->src_end)
         return 0;
@@ -343,6 +391,67 @@ static int singlematch(MatchState* ms, const char* s, const char* p, const char*
     }
 }
 
+// A match against a set scans it, so matchset and singlematch_charged charge it by the set's length. The charge follows
+// the scan, as in classend, so that two scans of a long set always have a charge between them.
+static int matchset(MatchState* ms, int c, const char* p, const char* ec)
+{
+    int res = matchbracketclass(c, p, ec);
+    match_charge(ms, ec - p);
+    return res;
+}
+
+static int singlematch_charged(MatchState* ms, const char* s, const char* p, const char* ep)
+{
+    int res = singlematch(ms, s, p, ep);
+    if (*p == '[' && s < ms->src_end)
+        match_charge(ms, ep - p);
+    return res;
+}
+
+// max_expand's scan of a long subject, which the work left doesn't pay for: it scans in stretches that the work left pays
+// for, plus one byte, and charges each stretch after it, so that the loop over the bytes doesn't store or call
+static LUAU_NOINLINE ptrdiff_t max_scanlong(MatchState* ms, const char* s, const char* p, const char* ep, ptrdiff_t cost)
+{
+    ptrdiff_t left = ms->src_end - s;
+    ptrdiff_t i = 0;
+    for (;;)
+    {
+        ptrdiff_t paid = ms->work / cost;
+        ptrdiff_t stop = paid < left - i ? i + paid + 1 : left;
+        ptrdiff_t start = i;
+        while (i < stop && singlematch(ms, s + i, p, ep))
+            i++;
+        // a byte that didn't match was compared too; at most paid + 1 bytes are, which costs at most the work left plus
+        // one byte's cost
+        match_charge(ms, (i - start + (i < left && i < stop)) * cost);
+        if (i < stop || i == left)
+            return i;
+    }
+}
+
+// max_expand's scan, charged a unit for each byte, or a set's length
+static ptrdiff_t max_scan(MatchState* ms, const char* s, const char* p, const char* ep)
+{
+    // '.' matches every byte, so there is nothing to scan
+    if (*p == '.')
+        return ms->src_end - s;
+
+    // the scan compares at most left bytes; the test divides, since left * cost can overflow on 32-bit targets
+    ptrdiff_t cost = *p == '[' ? ep - p : 1;
+    ptrdiff_t left = ms->src_end - s;
+    if (ms->budget && left >= ms->work / cost)
+        return max_scanlong(ms, s, p, ep, cost);
+
+    ptrdiff_t i = 0;
+    while (singlematch(ms, s + i, p, ep))
+        i++;
+    // the work left pays for every byte compared, the one that ended the scan included, so this doesn't call the
+    // interrupt
+    if (ms->budget)
+        ms->work -= (i < left ? i + 1 : i) * cost;
+    return i;
+}
+
 static const char* matchbalance(MatchState* ms, const char* s, const char* p)
 {
     if (p >= ms->p_end - 1)
@@ -356,6 +465,7 @@ static const char* matchbalance(MatchState* ms, const char* s, const char* p)
         int cont = 1;
         while (++s < ms->src_end)
         {
+            match_charge(ms, 1);
             if (*s == e)
             {
                 if (--cont == 0)
@@ -370,9 +480,7 @@ static const char* matchbalance(MatchState* ms, const char* s, const char* p)
 
 static const char* max_expand(MatchState* ms, const char* s, const char* p, const char* ep)
 {
-    ptrdiff_t i = 0; // counts maximum expand for item
-    while (singlematch(ms, s + i, p, ep))
-        i++;
+    ptrdiff_t i = max_scan(ms, s, p, ep); // counts maximum expand for item
     // keeps trying to match with the maximum repetitions
     while (i >= 0)
     {
@@ -391,7 +499,7 @@ static const char* min_expand(MatchState* ms, const char* s, const char* p, cons
         const char* res = match(ms, s, ep + 1);
         if (res != NULL)
             return res;
-        else if (singlematch(ms, s, p, ep))
+        else if (singlematch_charged(ms, s, p, ep))
             s++; // try with one more repetition
         else
             return NULL;
@@ -427,6 +535,8 @@ static const char* match_capture(MatchState* ms, const char* s, int l)
     size_t len;
     l = check_capture(ms, l);
     len = ms->capture[l].len;
+    if ((size_t)(ms->src_end - s) >= len)
+        match_charge(ms, ptrdiff_t(len));
     if ((size_t)(ms->src_end - s) >= len && memcmp(ms->capture[l].init, s, len) == 0)
         return s + len;
     else
@@ -441,7 +551,7 @@ static const char* match(MatchState* ms, const char* s, const char* p)
     lua_State* L = ms->L;
     void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
 
-    if (LUAU_UNLIKELY(!!interrupt))
+    if (!ms->budget && LUAU_UNLIKELY(!!interrupt))
     {
         // this interrupt is not yieldable
         L->nCcalls++;
@@ -450,6 +560,7 @@ static const char* match(MatchState* ms, const char* s, const char* p)
     }
 
 init: // using goto's to optimize tail recursion
+    match_charge(ms, 1);
     if (p != ms->p_end)
     { // end of pattern?
         switch (*p)
@@ -497,7 +608,7 @@ init: // using goto's to optimize tail recursion
                     luaL_error(ms->L, "missing '[' after '%%f' in pattern");
                 ep = classend(ms, p); // points to what is next
                 previous = (s == ms->src_init) ? '\0' : *(s - 1);
-                if (!matchbracketclass(uchar(previous), p, ep - 1) && matchbracketclass(uchar(*s), p, ep - 1))
+                if (!matchset(ms, uchar(previous), p, ep - 1) && matchset(ms, uchar(*s), p, ep - 1))
                 {
                     p = ep;
                     goto init; // return match(ms, s, ep);
@@ -534,7 +645,7 @@ init: // using goto's to optimize tail recursion
         {                                     // pattern class plus optional suffix
             const char* ep = classend(ms, p); // points to optional suffix
             // does not match at least once?
-            if (!singlematch(ms, s, p, ep))
+            if (!singlematch_charged(ms, s, p, ep))
             {
                 if (*ep == '*' || *ep == '?' || *ep == '-')
                 { // accept empty?
@@ -927,6 +1038,9 @@ static void push_onecapture(MatchState* ms, int i, const char* s, const char* e)
         else
             lua_pushlstring(ms->L, ms->capture[i].init, l);
     }
+    // the push hashes and compares the capture's bytes
+    ptrdiff_t len = i < ms->level ? ms->capture[i].len : e - s;
+    match_charge(ms, kMatchCaptureWork + (len > 0 ? len : 0));
 }
 
 static int push_captures(MatchState* ms, const char* s, const char* e)
@@ -942,6 +1056,32 @@ static int push_captures(MatchState* ms, const char* s, const char* e)
 // check whether pattern has no special characters
 static int nospecials(const char* p, size_t l)
 {
+    if (DFFlag::LuauPatternBudget)
+    {
+        // a strpbrk and a strlen call for each \0 in the pattern take 2.2 G instructions for 33M of them, with no
+        // interrupt; a table makes it one pass
+        struct SpecialChars
+        {
+            bool chars[256] = {};
+
+            SpecialChars()
+            {
+                for (const char* c = SPECIALS; *c; c++)
+                    chars[uchar(*c)] = true;
+            }
+        };
+
+        static const SpecialChars specials;
+
+        for (size_t i = 0; i < l; i++)
+        {
+            if (specials.chars[uchar(p[i])])
+                return 0;
+        }
+
+        return 1;
+    }
+
     size_t upto = 0;
     do
     {
@@ -955,6 +1095,8 @@ static int nospecials(const char* p, size_t l)
 static void prepstate(MatchState* ms, lua_State* L, const char* s, size_t ls, const char* p, size_t lp)
 {
     ms->L = L;
+    ms->budget = DFFlag::LuauPatternBudget;
+    ms->work = ms->budget ? kMatchInterruptWork : PTRDIFF_MAX;
     ms->matchdepth = LUAI_MAXCCALLS;
     ms->src_init = s;
     ms->src_end = s + ls;
@@ -1051,9 +1193,15 @@ static int gmatch_aux(lua_State* L)
             int newstart = (int)(e - s);
             if (e == src)
                 newstart++; // empty match? go at least one position
+            // with LuauPatternBudget, pushing a capture can call the interrupt, so the captures go first: an iterator
+            // called again after an error from the interrupt returns the same match
+            int n = ms.budget ? push_captures(&ms, src, e) : 0;
+            // the call started with LUA_MINSTACK free slots, and push_captures made room for its own pushes
+            if (n >= LUA_MINSTACK)
+                luaL_checkstack(L, 1, "too many captures");
             lua_pushinteger(L, newstart);
             lua_replace(L, lua_upvalueindex(3));
-            return push_captures(&ms, src, e);
+            return ms.budget ? n : push_captures(&ms, src, e);
         }
     }
     return 0; // not found
@@ -1078,6 +1226,8 @@ static void add_s(MatchState* ms, luaL_Strbuf* b, const char* s, const char* e)
 
     for (i = 0; i < l; i++)
     {
+        // an empty capture, or %0 of an empty match, adds nothing to the result, so the heap limit doesn't bound this
+        match_charge(ms, 1);
         if (news[i] != L_ESC)
             luaL_addchar(b, news[i]);
         else
@@ -1230,6 +1380,10 @@ static int str_gsub(lua_State* L)
                 break;
 
             n++;
+
+            // the search is linear, but replacing 33M matches through a table takes about a second; the match is
+            // charged by the bytes it moves past
+            match_charge(&ms, e + lp - src);
 
             if (e != src)
                 luaL_addlstring(&b, src, e - src);
@@ -1515,8 +1669,18 @@ static int str_split(lua_State* L)
             char sep = needle[0];
 
             int count = 1;
-            for (const char* iter = haystack; (iter = (const char*)memchr(iter, sep, end - iter)) != NULL; iter++)
-                count++;
+            if (DFFlag::LuauPatternBudget)
+            {
+                // a memchr call for each separator takes 150 ms for 33M of them, with no interrupt; compilers vectorize
+                // this loop
+                for (size_t i = 0; i < haystackLen; i++)
+                    count += haystack[i] == sep;
+            }
+            else
+            {
+                for (const char* iter = haystack; (iter = (const char*)memchr(iter, sep, end - iter)) != NULL; iter++)
+                    count++;
+            }
 
             lua_createtable(L, count, 0);
 
@@ -1681,6 +1845,7 @@ typedef struct Header
     lua_State* L;
     int islittle;
     int maxalign;
+    int options; // with LuauStringPackInterrupt, options left before the next interrupt call
 } Header;
 
 /*
@@ -1740,11 +1905,33 @@ static int getnumlimit(Header* h, const char** fmt, int df)
 /*
 ** Initialize Header
 */
+// With LuauStringPackInterrupt, pack, unpack and packsize call the interrupt every this many options: a format string
+// at the heap limit has 33M of them, which take up to 290 ms, and an option's own work is bounded by the bytes it adds
+// or reads
+const int kPackInterruptOptions = 8192;
+
 static void initheader(lua_State* L, Header* h)
 {
     h->L = L;
     h->islittle = nativeendian.little;
     h->maxalign = 1;
+    h->options = kPackInterruptOptions;
+}
+
+static LUAU_NOINLINE void pack_interrupt(Header* h)
+{
+    lua_State* L = h->L;
+    void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
+
+    h->options = kPackInterruptOptions;
+
+    if (interrupt)
+    {
+        // this interrupt is not yieldable
+        L->nCcalls++;
+        interrupt(L, -1);
+        L->nCcalls--;
+    }
 }
 
 /*
@@ -1844,6 +2031,8 @@ static KOption getoption(Header* h, const char** fmt, int* size)
 */
 static KOption getdetails(Header* h, size_t totalsize, const char** fmt, int* psize, int* ntoalign)
 {
+    if (DFFlag::LuauStringPackInterrupt && --h->options == 0)
+        pack_interrupt(h);
     KOption opt = getoption(h, fmt, psize);
     int align = *psize; // usually, alignment follows size
     if (opt == Kpaddalign)

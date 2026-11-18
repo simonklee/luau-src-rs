@@ -222,6 +222,9 @@ lua_State* lua_newstate(lua_Alloc allocator, void* ud)
     g->gcgoal = LUAI_GCGOAL;
     g->gcstepmul = LUAI_GCSTEPMUL;
     g->gcstepsize = LUAI_GCSTEPSIZE << 10;
+    g->gcgoallarge = LUAI_GCGOAL;
+    g->gcstepmullarge = LUAI_GCSTEPMUL;
+    g->gcgoalthreshold = SIZE_MAX;
 
     g->cb = lua_Callbacks();
     g->ecb = lua_ExecutionCallbacks();

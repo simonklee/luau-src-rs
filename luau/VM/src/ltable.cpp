@@ -376,6 +376,10 @@ static LUAU_NOINLINE int rawfindnode(const LuaTable* t, int startpos, const TVal
 
         if (luaO_rawequalObj(e, value))
             return i;
+
+        // the next index would overflow
+        if (i == INT_MAX)
+            return 0;
     }
 
     return 0;
