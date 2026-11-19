@@ -944,20 +944,40 @@ reentry:
                     // for predictive lookups
                     LuaNode* n = &h->node[tsvalue(kv)->hash & (sizenode(h) - 1)];
 
+                    // the key's chain: its main position, or further down where a key that holds the main position sent it. Which
+                    // keys collide is chance (with DFFlag::LuauTableKeyedHash, it changes with the VM's key), so a method stored in
+                    // the table out of its main position, or one inherited by a table whose chain there holds other keys, would
+                    // otherwise take the slow path on every call
+                    const TValue* res = 0;
+                    for (;;)
+                    {
+                        if (ttisstring(gkey(n)) && tsvalue(gkey(n)) == tsvalue(kv))
+                        {
+                            res = gval(n);
+                            break;
+                        }
+                        if (gnext(n) == 0)
+                            break;
+                        n += gnext(n);
+                    }
+
                     const TValue* mt = 0;
                     const LuaNode* mtn = 0;
 
-                    // fast-path: key is in the table in expected slot
-                    if (ttisstring(gkey(n)) && tsvalue(gkey(n)) == tsvalue(kv) && !ttisnil(gval(n)))
+                    // fast-path: key is in the table
+                    if (res && !ttisnil(res))
                     {
                         // note: order of copies allows rb to alias ra+1 or ra
                         setobj2s(L, ra + 1, rb);
-                        setobj2s(L, ra, gval(n));
+                        setobj2s(L, ra, res);
                     }
-                    // fast-path: key is absent from the base, table has an __index table, and it has the result in the expected slot
-                    else if (gnext(n) == 0 && (mt = fasttm(L, hvalue(rb)->metatable, TM_INDEX)) && ttistable(mt) &&
-                             (mtn = &hvalue(mt)->node[LUAU_INSN_C(insn) & hvalue(mt)->nodemask8]) && ttisstring(gkey(mtn)) &&
-                             tsvalue(gkey(mtn)) == tsvalue(kv) && !ttisnil(gval(mtn)))
+                    // fast-path: key is absent from the base (or nil there), table has an __index table, and it has the result in
+                    // the expected slot
+                    else if (
+                        (mt = fasttm(L, hvalue(rb)->metatable, TM_INDEX)) && ttistable(mt) &&
+                        (mtn = &hvalue(mt)->node[LUAU_INSN_C(insn) & hvalue(mt)->nodemask8]) && ttisstring(gkey(mtn)) &&
+                        tsvalue(gkey(mtn)) == tsvalue(kv) && !ttisnil(gval(mtn))
+                    )
                     {
                         // note: order of copies allows rb to alias ra+1 or ra
                         setobj2s(L, ra + 1, rb);

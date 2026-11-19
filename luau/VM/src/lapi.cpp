@@ -844,7 +844,7 @@ int lua_rawget(lua_State* L, int idx)
     luaC_threadbarrier(L);
     StkId t = index2addr(L, idx);
     api_check(L, ttistable(t));
-    setobj2s(L, L->top - 1, luaH_get(L, hvalue(t), L->top - 1));
+    setobj2s(L, L->top - 1, luaH_get(hvalue(t), L->top - 1, L));
     return ttype(L->top - 1);
 }
 
@@ -854,7 +854,7 @@ int lua_rawgeti(lua_State* L, int idx, int n)
     ensure_stack(L, 1);
     StkId t = index2addr(L, idx);
     api_check(L, ttistable(t));
-    setobj2s(L, L->top, luaH_getnum(L, hvalue(t), n));
+    setobj2s(L, L->top, luaH_getnum(hvalue(t), n, L));
     api_incr_top(L);
     return ttype(L->top - 1);
 }
@@ -865,7 +865,7 @@ int lua_rawgetptagged(lua_State* L, int idx, void* p, int tag)
     ensure_stack(L, 1);
     StkId t = index2addr(L, idx);
     api_check(L, ttistable(t));
-    setobj2s(L, L->top, luaH_getp(L, hvalue(t), p, tag));
+    setobj2s(L, L->top, luaH_getp(hvalue(t), p, tag, L));
     api_incr_top(L);
     return ttype(L->top - 1);
 }
@@ -2001,7 +2001,7 @@ int lua_unref(lua_State* L, int ref)
     global_State* g = L->global;
     LuaTable* reg = hvalue(registry(L));
 
-    const TValue* slot = luaH_getnum(L, reg, ref);
+    const TValue* slot = luaH_getnum(reg, ref, L);
     api_check(L, slot != luaO_nilobject);
 
     // similar to how 'luaH_setnum' makes non-nil slot value mutable
@@ -2105,7 +2105,7 @@ int lua_getweakref(lua_State* L, int ref)
     luaC_threadbarrier(L);
     ensure_stack(L, 1);
     LuaTable* wr = hvalue(&L->global->weakregistry);
-    setobj2s(L, L->top, luaH_getnum(L, wr, ref));
+    setobj2s(L, L->top, luaH_getnum(wr, ref, L));
     api_incr_top(L);
     return ttype(L->top - 1);
 }
