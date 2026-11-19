@@ -207,7 +207,9 @@ typedef struct MatchState
     } capture[LUA_MAXCAPTURES];
 } MatchState;
 
-// recursive function
+// recursive function; Budget is MatchState::budget, so that without LuauPatternBudget no charge runs, and with it no
+// test of the flag does
+template<bool Budget>
 static const char* match(MatchState* ms, const char* s, const char* p);
 
 // With LuauPatternBudget, pattern functions charge their work to MatchState::work instead of calling the interrupt at
@@ -216,7 +218,8 @@ static const char* match(MatchState* ms, const char* s, const char* p);
 // for each capture they push. When a charge takes the work left below zero, they call the interrupt and start again from
 // kMatchInterruptWork. So the work between two calls is bounded, and a function call that matches a short subject
 // doesn't call it at all. Without the flag, match() calls the interrupt at every entry, as before, and nothing else
-// does: the charges never reach the interrupt.
+// does: the match functions are instantiated without the charges, and the other charges test MatchState::budget, except
+// gsub's literal path, which can't spend the PTRDIFF_MAX it starts with in one call.
 const ptrdiff_t kMatchInterruptWork = 1 << 13;
 
 // a capture is pushed as a string, for a replacement function or table, for %1 in a replacement string, or as a result;
@@ -225,14 +228,9 @@ const ptrdiff_t kMatchCaptureWork = 32;
 
 static LUAU_NOINLINE void match_interrupt(MatchState* ms)
 {
+    LUAU_ASSERT(ms->budget);
     lua_State* L = ms->L;
     void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
-
-    if (!ms->budget)
-    {
-        ms->work = PTRDIFF_MAX;
-        return;
-    }
 
     ms->work = kMatchInterruptWork;
 
@@ -245,8 +243,11 @@ static LUAU_NOINLINE void match_interrupt(MatchState* ms)
     }
 }
 
+template<bool Budget>
 static LUAU_FORCEINLINE void match_charge(MatchState* ms, ptrdiff_t units)
 {
+    if (!Budget)
+        return;
     ms->work -= units;
     if (LUAU_UNLIKELY(ms->work < 0))
         match_interrupt(ms);
@@ -272,6 +273,7 @@ static int capture_to_close(MatchState* ms)
     luaL_error(ms->L, "invalid pattern capture");
 }
 
+template<bool Budget>
 static const char* classend(MatchState* ms, const char* p)
 {
     switch (*p++)
@@ -294,7 +296,7 @@ static const char* classend(MatchState* ms, const char* p)
             if (*(p++) == L_ESC && p < ms->p_end)
                 p++; // skip escapes (e.g. `%]')
         } while (*p != ']');
-        match_charge(ms, p - set);
+        match_charge<Budget>(ms, p - set);
         return p + 1;
     }
     default:
@@ -399,18 +401,20 @@ static LUAU_FORCEINLINE int singlematch(MatchState* ms, const char* s, const cha
 
 // A match against a set scans it, so matchset and singlematch_charged charge it by the set's length. The charge follows
 // the scan, as in classend, so that two scans of a long set always have a charge between them.
+template<bool Budget>
 static int matchset(MatchState* ms, int c, const char* p, const char* ec)
 {
     int res = matchbracketclass(c, p, ec);
-    match_charge(ms, ec - p);
+    match_charge<Budget>(ms, ec - p);
     return res;
 }
 
+template<bool Budget>
 static int singlematch_charged(MatchState* ms, const char* s, const char* p, const char* ep)
 {
     int res = singlematch(ms, s, p, ep);
     if (*p == '[' && s < ms->src_end)
-        match_charge(ms, ep - p);
+        match_charge<Budget>(ms, ep - p);
     return res;
 }
 
@@ -429,23 +433,39 @@ static LUAU_NOINLINE ptrdiff_t max_scanlong(MatchState* ms, const char* s, const
             i++;
         // a byte that didn't match was compared too; at most paid + 1 bytes are, which costs at most the work left plus
         // one byte's cost
-        match_charge(ms, (i - start + (i < left && i < stop)) * cost);
+        match_charge<true>(ms, (i - start + (i < left && i < stop)) * cost);
         if (i < stop || i == left)
             return i;
     }
 }
 
 // max_expand's scan, charged a unit for each byte, or a set's length
+template<bool Budget>
 static ptrdiff_t max_scan(MatchState* ms, const char* s, const char* p, const char* ep)
 {
     // '.' matches every byte, so there is nothing to scan
     if (*p == '.')
         return ms->src_end - s;
 
-    // the scan compares at most left bytes; the test divides, since left * cost can overflow on 32-bit targets
-    ptrdiff_t cost = *p == '[' ? ep - p : 1;
+    // the scan compares at most left bytes
     ptrdiff_t left = ms->src_end - s;
-    if (ms->budget && left >= ms->work / cost)
+    if (*p != '[')
+    {
+        if (Budget && left >= ms->work)
+            return max_scanlong(ms, s, p, ep, 1);
+
+        ptrdiff_t i = 0;
+        while (singlematch(ms, s + i, p, ep))
+            i++;
+        // as below, with a unit for each byte
+        if (Budget)
+            ms->work -= i + (i < left);
+        return i;
+    }
+
+    // a set's test divides, since left * cost can overflow on 32-bit targets
+    ptrdiff_t cost = ep - p;
+    if (Budget && left >= ms->work / cost)
         return max_scanlong(ms, s, p, ep, cost);
 
     ptrdiff_t i = 0;
@@ -453,11 +473,12 @@ static ptrdiff_t max_scan(MatchState* ms, const char* s, const char* p, const ch
         i++;
     // the work left pays for every byte compared, the one that ended the scan included, so this doesn't call the
     // interrupt
-    if (ms->budget)
+    if (Budget)
         ms->work -= (i < left ? i + 1 : i) * cost;
     return i;
 }
 
+template<bool Budget>
 static const char* matchbalance(MatchState* ms, const char* s, const char* p)
 {
     if (p >= ms->p_end - 1)
@@ -471,7 +492,7 @@ static const char* matchbalance(MatchState* ms, const char* s, const char* p)
         int cont = 1;
         while (++s < ms->src_end)
         {
-            match_charge(ms, 1);
+            match_charge<Budget>(ms, 1);
             if (*s == e)
             {
                 if (--cont == 0)
@@ -484,13 +505,14 @@ static const char* matchbalance(MatchState* ms, const char* s, const char* p)
     return NULL; // string ends out of balance
 }
 
+template<bool Budget>
 static const char* max_expand(MatchState* ms, const char* s, const char* p, const char* ep)
 {
-    ptrdiff_t i = max_scan(ms, s, p, ep); // counts maximum expand for item
+    ptrdiff_t i = max_scan<Budget>(ms, s, p, ep); // counts maximum expand for item
     // keeps trying to match with the maximum repetitions
     while (i >= 0)
     {
-        const char* res = match(ms, (s + i), ep + 1);
+        const char* res = match<Budget>(ms, (s + i), ep + 1);
         if (res)
             return res;
         i--; // else didn't match; reduce 1 repetition to try again
@@ -498,20 +520,22 @@ static const char* max_expand(MatchState* ms, const char* s, const char* p, cons
     return NULL;
 }
 
+template<bool Budget>
 static const char* min_expand(MatchState* ms, const char* s, const char* p, const char* ep)
 {
     for (;;)
     {
-        const char* res = match(ms, s, ep + 1);
+        const char* res = match<Budget>(ms, s, ep + 1);
         if (res != NULL)
             return res;
-        else if (singlematch_charged(ms, s, p, ep))
+        else if (singlematch_charged<Budget>(ms, s, p, ep))
             s++; // try with one more repetition
         else
             return NULL;
     }
 }
 
+template<bool Budget>
 static const char* start_capture(MatchState* ms, const char* s, const char* p, int what)
 {
     const char* res;
@@ -521,52 +545,58 @@ static const char* start_capture(MatchState* ms, const char* s, const char* p, i
     ms->capture[level].init = s;
     ms->capture[level].len = what;
     ms->level = level + 1;
-    if ((res = match(ms, s, p)) == NULL) // match failed?
+    if ((res = match<Budget>(ms, s, p)) == NULL) // match failed?
         ms->level--;                     // undo capture
     return res;
 }
 
+template<bool Budget>
 static const char* end_capture(MatchState* ms, const char* s, const char* p)
 {
     int l = capture_to_close(ms);
     const char* res;
     ms->capture[l].len = s - ms->capture[l].init; // close capture
-    if ((res = match(ms, s, p)) == NULL)          // match failed?
+    if ((res = match<Budget>(ms, s, p)) == NULL)  // match failed?
         ms->capture[l].len = CAP_UNFINISHED;      // undo capture
     return res;
 }
 
+template<bool Budget>
 static const char* match_capture(MatchState* ms, const char* s, int l)
 {
     size_t len;
     l = check_capture(ms, l);
     len = ms->capture[l].len;
     if ((size_t)(ms->src_end - s) >= len)
-        match_charge(ms, ptrdiff_t(len));
+        match_charge<Budget>(ms, ptrdiff_t(len));
     if ((size_t)(ms->src_end - s) >= len && memcmp(ms->capture[l].init, s, len) == 0)
         return s + len;
     else
         return NULL;
 }
 
+template<bool Budget>
 static const char* match(MatchState* ms, const char* s, const char* p)
 {
     if (ms->matchdepth-- == 0)
         luaL_error(ms->L, "pattern too complex");
 
-    lua_State* L = ms->L;
-    void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
-
-    if (!ms->budget && LUAU_UNLIKELY(!!interrupt))
+    if (!Budget)
     {
-        // this interrupt is not yieldable
-        L->nCcalls++;
-        interrupt(L, -1);
-        L->nCcalls--;
+        lua_State* L = ms->L;
+        void (*interrupt)(lua_State*, int) = L->global->cb.interrupt;
+
+        if (LUAU_UNLIKELY(!!interrupt))
+        {
+            // this interrupt is not yieldable
+            L->nCcalls++;
+            interrupt(L, -1);
+            L->nCcalls--;
+        }
     }
 
 init: // using goto's to optimize tail recursion
-    match_charge(ms, 1);
+    match_charge<Budget>(ms, 1);
     if (p != ms->p_end)
     { // end of pattern?
         switch (*p)
@@ -574,14 +604,14 @@ init: // using goto's to optimize tail recursion
         case '(':
         {                        // start capture
             if (*(p + 1) == ')') // position capture?
-                s = start_capture(ms, s, p + 2, CAP_POSITION);
+                s = start_capture<Budget>(ms, s, p + 2, CAP_POSITION);
             else
-                s = start_capture(ms, s, p + 1, CAP_UNFINISHED);
+                s = start_capture<Budget>(ms, s, p + 1, CAP_UNFINISHED);
             break;
         }
         case ')':
         { // end capture
-            s = end_capture(ms, s, p + 1);
+            s = end_capture<Budget>(ms, s, p + 1);
             break;
         }
         case '$':
@@ -597,7 +627,7 @@ init: // using goto's to optimize tail recursion
             {
             case 'b':
             { // balanced string?
-                s = matchbalance(ms, s, p + 2);
+                s = matchbalance<Budget>(ms, s, p + 2);
                 if (s != NULL)
                 {
                     p += 4;
@@ -612,9 +642,9 @@ init: // using goto's to optimize tail recursion
                 p += 2;
                 if (*p != '[')
                     luaL_error(ms->L, "missing '[' after '%%f' in pattern");
-                ep = classend(ms, p); // points to what is next
+                ep = classend<Budget>(ms, p); // points to what is next
                 previous = (s == ms->src_init) ? '\0' : *(s - 1);
-                if (!matchset(ms, uchar(previous), p, ep - 1) && matchset(ms, uchar(*s), p, ep - 1))
+                if (!matchset<Budget>(ms, uchar(previous), p, ep - 1) && matchset<Budget>(ms, uchar(*s), p, ep - 1))
                 {
                     p = ep;
                     goto init; // return match(ms, s, ep);
@@ -633,7 +663,7 @@ init: // using goto's to optimize tail recursion
             case '8':
             case '9':
             { // capture results (%0-%9)?
-                s = match_capture(ms, s, uchar(*(p + 1)));
+                s = match_capture<Budget>(ms, s, uchar(*(p + 1)));
                 if (s != NULL)
                 {
                     p += 2;
@@ -649,9 +679,9 @@ init: // using goto's to optimize tail recursion
         default:
         dflt:
         {                                     // pattern class plus optional suffix
-            const char* ep = classend(ms, p); // points to optional suffix
+            const char* ep = classend<Budget>(ms, p); // points to optional suffix
             // does not match at least once?
-            if (!singlematch_charged(ms, s, p, ep))
+            if (!singlematch_charged<Budget>(ms, s, p, ep))
             {
                 if (*ep == '*' || *ep == '?' || *ep == '-')
                 { // accept empty?
@@ -668,7 +698,7 @@ init: // using goto's to optimize tail recursion
                 case '?':
                 { // optional
                     const char* res;
-                    if ((res = match(ms, s + 1, ep + 1)) != NULL)
+                    if ((res = match<Budget>(ms, s + 1, ep + 1)) != NULL)
                         s = res;
                     else
                     {
@@ -681,10 +711,10 @@ init: // using goto's to optimize tail recursion
                     s++;              // 1 match already done
                     LUAU_FALLTHROUGH; // go through
                 case '*':             // 0 or more repetitions
-                    s = max_expand(ms, s, p, ep);
+                    s = max_expand<Budget>(ms, s, p, ep);
                     break;
                 case '-': // 0 or more repetitions (minimum)
-                    s = min_expand(ms, s, p, ep);
+                    s = min_expand<Budget>(ms, s, p, ep);
                     break;
                 default: // no suffix
                     s++;
@@ -1027,8 +1057,10 @@ static const char* lmemfind(const char* s1, size_t l1, const char* s2, size_t l2
 
 static void push_onecapture(MatchState* ms, int i, const char* s, const char* e)
 {
+    ptrdiff_t l;
     if (i >= ms->level)
     {
+        l = e - s;
         if (i == 0)                           // ms->level == 0, too
             lua_pushlstring(ms->L, s, e - s); // add whole match
         else
@@ -1036,7 +1068,7 @@ static void push_onecapture(MatchState* ms, int i, const char* s, const char* e)
     }
     else
     {
-        ptrdiff_t l = ms->capture[i].len;
+        l = ms->capture[i].len;
         if (l == CAP_UNFINISHED)
             luaL_error(ms->L, "unfinished capture");
         if (l == CAP_POSITION)
@@ -1044,9 +1076,9 @@ static void push_onecapture(MatchState* ms, int i, const char* s, const char* e)
         else
             lua_pushlstring(ms->L, ms->capture[i].init, l);
     }
-    // the push hashes and compares the capture's bytes
-    ptrdiff_t len = i < ms->level ? ms->capture[i].len : e - s;
-    match_charge(ms, kMatchCaptureWork + (len > 0 ? len : 0));
+    // the push hashes and compares the capture's bytes; a position capture's length is CAP_POSITION
+    if (ms->budget)
+        match_charge<true>(ms, kMatchCaptureWork + (l > 0 ? l : 0));
 }
 
 static int push_captures(MatchState* ms, const char* s, const char* e)
@@ -1096,6 +1128,11 @@ static int nospecials(const char* p, size_t l)
         upto += strlen(p + upto) + 1; // may have more after \0
     } while (upto <= l);
     return 1; // no special chars found
+}
+
+static const char* match_start(MatchState* ms, const char* s, const char* p)
+{
+    return ms->budget ? match<true>(ms, s, p) : match<false>(ms, s, p);
 }
 
 static void prepstate(MatchState* ms, lua_State* L, const char* s, size_t ls, const char* p, size_t lp)
@@ -1172,7 +1209,7 @@ static bool classscan_compile(MatchState* ms, ClassScan* cs, const char* p, size
             if (*(q++) == L_ESC && q < end)
                 q++;
         } while (*q != ']');
-        match_charge(ms, q - p - 1);
+        match_charge<true>(ms, q - p - 1);
         if (q == end)
             return false;
         ep = q + 1;
@@ -1207,7 +1244,7 @@ static LUAU_NOINLINE void classscan_resolve(MatchState* ms, ClassScan* cs, int c
         res = match_class(c, uchar(*(p + 1)));
         break;
     case '[':
-        res = matchset(ms, c, p, cs->ep - 1);
+        res = matchset<true>(ms, c, p, cs->ep - 1);
         break;
     default:
         res = (uchar(*p) == c);
@@ -1231,13 +1268,13 @@ static const char* classscan_span(MatchState* ms, ClassScan* cs, const char* s)
         if (q < stop && cs->set[uchar(*q)] == CLASSSCAN_UNKNOWN)
         {
             // a byte value the scan hasn't met: test it, and scan on from it
-            match_charge(ms, q - s);
+            match_charge<true>(ms, q - s);
             classscan_resolve(ms, cs, uchar(*q));
             s = q;
             continue;
         }
         // the byte that ended the scan was compared too
-        match_charge(ms, (q - s) + (q < stop));
+        match_charge<true>(ms, (q - s) + (q < stop));
         if (q < stop || q == ms->src_end)
             return q;
         s = q;
@@ -1259,7 +1296,7 @@ static const char* classscan_find(MatchState* ms, ClassScan* cs, const char* s)
 static const char* classscan_match(MatchState* ms, ClassScan* cs, const char* s)
 {
     // as match()'s step, so that empty matches are charged
-    match_charge(ms, 1);
+    match_charge<true>(ms, 1);
 
     // '.' matches every byte, so there is nothing to scan, as in max_scan
     if (*cs->p == '.' && (cs->op == '*' || cs->op == '+'))
@@ -1381,7 +1418,7 @@ static int str_find_aux(lua_State* L, int find)
         {
             const char* res;
             reprepstate(&ms);
-            if ((res = match(&ms, s1, p)) != NULL)
+            if ((res = match_start(&ms, s1, p)) != NULL)
             {
                 if (find)
                 {
@@ -1423,7 +1460,7 @@ static int gmatch_aux(lua_State* L)
     {
         const char* e;
         reprepstate(&ms);
-        if ((e = match(&ms, src, p)) != NULL)
+        if ((e = match_start(&ms, src, p)) != NULL)
         {
             int newstart = (int)(e - s);
             if (e == src)
@@ -1460,10 +1497,12 @@ static void add_s(MatchState* ms, luaL_Strbuf* b, const char* s, const char* e)
 
     luaL_prepbuffsize(b, l);
 
+    bool budget = ms->budget;
     for (i = 0; i < l; i++)
     {
         // an empty capture, or %0 of an empty match, adds nothing to the result, so the heap limit doesn't bound this
-        match_charge(ms, 1);
+        if (budget)
+            match_charge<true>(ms, 1);
         if (news[i] != L_ESC)
             luaL_addchar(b, news[i]);
         else
@@ -1603,7 +1642,7 @@ static int str_gsub_class(MatchState* ms, ClassScan* cs, luaL_Strbuf* b, const c
         if (plainrepl)
         {
             // a unit for each byte of the replacement, as add_s charges
-            match_charge(ms, repll);
+            match_charge<true>(ms, repll);
             luaL_addlstring(b, repl, repll);
         }
         else
@@ -1666,8 +1705,9 @@ static int str_gsub(lua_State* L)
             n++;
 
             // the search is linear, but replacing 33M matches through a table takes about a second; the match is
-            // charged by the bytes it moves past
-            match_charge(&ms, e + lp - src);
+            // charged by the bytes it moves past; without the flag, the work left starts at PTRDIFF_MAX and a call
+            // charges at most the subject's length, which costs less than testing the flag here
+            match_charge<true>(&ms, e + lp - src);
 
             if (e != src)
                 luaL_addlstring(&b, src, e - src);
@@ -1701,7 +1741,7 @@ static int str_gsub(lua_State* L)
         {
             const char* e;
             reprepstate(&ms);
-            e = match(&ms, src, p);
+            e = match_start(&ms, src, p);
             if (e)
             {
                 n++;

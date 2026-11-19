@@ -456,6 +456,16 @@ enum lua_PeekFlags
 
 LUA_API int lua_rawiterpeek(lua_State* L, int idx, int iter, lua_Peek* key, lua_Peek* value, int flags);
 
+/*
+** lua_tableslots: the number of slots lua_rawiter and lua_rawiterpeek scan for the table at idx
+**
+** It's the table's array part plus its hash part's nodes, empty ones included. A table with no hash part counts its one
+** shared empty node, which the iterators scan too, so an empty table has 1 slot. A full walk scans every slot once:
+** each call returns an iter from 1 to this count, or -1 after the last slot. The count changes only when the table is
+** resized. idx must refer to a table; as for lua_rawiter, that is checked only when Luau is built with its asserts on.
+*/
+LUA_API int lua_tableslots(lua_State* L, int idx);
+
 LUA_API void lua_concat(lua_State* L, int n);
 
 LUA_API void lua_setpointerencodekey(lua_State* L, uint64_t a, uint64_t b, uint64_t c, uint64_t d);

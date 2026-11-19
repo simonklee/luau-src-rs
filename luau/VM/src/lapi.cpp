@@ -1721,6 +1721,16 @@ found:
     return iter + 1;
 }
 
+int lua_tableslots(lua_State* L, int idx)
+{
+    const TValue* t = index2addr(L, idx);
+    api_check(L, ttistable(t));
+
+    // the ranges lua_rawiter scans: both parts are at most 2^26 slots (MAXBITS), so the sum fits in an int
+    const LuaTable* h = hvalue(t);
+    return h->sizearray + sizenode(h);
+}
+
 void lua_concat(lua_State* L, int n)
 {
     api_check(L, n >= 0);

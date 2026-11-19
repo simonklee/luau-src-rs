@@ -1130,6 +1130,23 @@ void* luaM_realloc_(lua_State* L, void* block, size_t osize, size_t nsize, uint8
     return result;
 }
 
+// a class quiet for kChurnQuietCycles cycles in a row has stopped churning: its floor halves. A class with no freed pages
+// to count goes to 0, not through the quiet counts: its count only grows along with kChurnActive, which resets them, so
+// they would never be read, and a 0 lets luaM_endcycle skip it
+static void decaychurn(uint8_t& churn)
+{
+    int count = churn & kChurnCount;
+
+    if ((churn & kChurnActive) || count == 0)
+        churn = uint8_t(count);
+    else if ((churn & kChurnQuiet) / kChurnQuietOne + 1 >= kChurnQuietCycles)
+        churn = uint8_t(count > kChurnPagesPerLevel ? count - kChurnPagesPerLevel : 0);
+    else
+        churn += kChurnQuietOne;
+}
+
+// runs at the end of every GC cycle, which a small heap that churns garbage reaches every few dozen allocations, so it
+// skips what has nothing to do: classes with no free page, and pagechurn eight bytes of zeros at a time
 void luaM_endcycle(lua_State* L, bool cycle)
 {
     global_State* g = L->global;
@@ -1144,24 +1161,29 @@ void luaM_endcycle(lua_State* L, bool cycle)
             LUAU_ASSERT(!page->next);
             freeclasspage<AllocationPath::Frealloc, 0>(L, g->freepages, debugpageset(&g->allpages), page, uint8_t(i));
         }
-
-        if (!cycle)
-            continue;
-
-        // a class quiet for kChurnQuietCycles cycles in a row has stopped churning: its floor halves
-        for (int gco = 0; gco < 2; gco++)
-        {
-            uint8_t& churn = g->pagechurn[gco][i];
-            int count = churn & kChurnCount;
-
-            if (churn & kChurnActive)
-                churn = uint8_t(count);
-            else if ((churn & kChurnQuiet) / kChurnQuietOne + 1 >= kChurnQuietCycles)
-                churn = uint8_t(count > kChurnPagesPerLevel ? count - kChurnPagesPerLevel : 0);
-            else
-                churn += kChurnQuietOne;
-        }
     }
+
+    if (!cycle)
+        return;
+
+    uint8_t* churn = &g->pagechurn[0][0];
+    const int count = int(sizeof(g->pagechurn));
+    int i = 0;
+
+    for (; i + 8 <= count; i += 8)
+    {
+        uint64_t word;
+        memcpy(&word, churn + i, sizeof(word));
+
+        if (word != 0)
+            for (int j = i; j < i + 8; j++)
+                if (churn[j])
+                    decaychurn(churn[j]);
+    }
+
+    for (; i < count; i++)
+        if (churn[i])
+            decaychurn(churn[i]);
 }
 
 size_t luaM_countemptypages(lua_State* L)
