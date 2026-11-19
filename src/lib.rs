@@ -22,6 +22,7 @@ pub struct Artifacts {
     lib_dir: PathBuf,
     libs: Vec<String>,
     cpp_stdlib: Option<String>,
+    system_libs: Vec<String>,
 }
 
 impl Default for Build {
@@ -388,6 +389,13 @@ impl Build {
                 require_lib_name.to_string(),
             ],
             cpp_stdlib: Self::get_cpp_link_stdlib(target, host),
+            // The VM seeds its string and table hashes with BCryptGenRandom on Windows; MSVC
+            // links it through a pragma, MinGW needs the library named
+            system_libs: if target.contains("windows") {
+                vec!["bcrypt".to_string()]
+            } else {
+                Vec::new()
+            },
         };
 
         if self.enable_codegen {
@@ -447,6 +455,9 @@ impl Artifacts {
         }
         if let Some(ref cpp_stdlib) = self.cpp_stdlib {
             println!("cargo:rustc-link-lib={cpp_stdlib}");
+        }
+        for lib in &self.system_libs {
+            println!("cargo:rustc-link-lib={lib}");
         }
         if let Some(version) = self.version() {
             println!("cargo:rustc-env=LUAU_VERSION={version}");
