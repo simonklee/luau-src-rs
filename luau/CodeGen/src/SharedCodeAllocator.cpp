@@ -45,10 +45,12 @@ NativeModule::NativeModule(
     SharedCodeAllocator* allocator,
     const std::optional<ModuleId>& moduleId,
     CodeAllocationData codeAllocationData,
-    std::vector<NativeProtoExecDataPtr> nativeProtos
+    std::vector<NativeProtoExecDataPtr> nativeProtos,
+    uint8_t partition
 ) noexcept
     : allocator{allocator}
     , moduleId{moduleId}
+    , partition{partition}
     , codeAllocationData{codeAllocationData}
     , nativeProtos{std::move(nativeProtos)}
 {
@@ -111,6 +113,11 @@ size_t NativeModule::release() const noexcept
 [[nodiscard]] const std::optional<ModuleId>& NativeModule::getModuleId() const noexcept
 {
     return moduleId;
+}
+
+[[nodiscard]] uint8_t NativeModule::getPartition() const noexcept
+{
+    return partition;
 }
 
 [[nodiscard]] const uint8_t* NativeModule::getModuleBaseAddress() const noexcept
@@ -224,11 +231,11 @@ SharedCodeAllocator::~SharedCodeAllocator() noexcept
     CODEGEN_ASSERT(anonymousModuleCount == 0);
 }
 
-[[nodiscard]] NativeModuleRef SharedCodeAllocator::tryGetNativeModule(const ModuleId& moduleId) const noexcept
+[[nodiscard]] NativeModuleRef SharedCodeAllocator::tryGetNativeModule(const ModuleId& moduleId, uint8_t partition) const noexcept
 {
     std::unique_lock lock{mutex};
 
-    return tryGetNativeModuleWithLockHeld(moduleId);
+    return tryGetNativeModuleWithLockHeld({moduleId, partition});
 }
 
 std::pair<NativeModuleRef, bool> SharedCodeAllocator::getOrInsertNativeModule(
@@ -237,12 +244,13 @@ std::pair<NativeModuleRef, bool> SharedCodeAllocator::getOrInsertNativeModule(
     const uint8_t* data,
     size_t dataSize,
     const uint8_t* code,
-    size_t codeSize
+    size_t codeSize,
+    uint8_t partition
 )
 {
     std::unique_lock lock{mutex};
 
-    if (NativeModuleRef existingModule = tryGetNativeModuleWithLockHeld(moduleId))
+    if (NativeModuleRef existingModule = tryGetNativeModuleWithLockHeld({moduleId, partition}))
         return {std::move(existingModule), false};
 
     CodeAllocationData result = codeAllocator->allocate(data, int(dataSize), code, int(codeSize));
@@ -250,8 +258,8 @@ std::pair<NativeModuleRef, bool> SharedCodeAllocator::getOrInsertNativeModule(
     if (!result.start)
         return {};
 
-    std::unique_ptr<NativeModule>& nativeModule = identifiedModules[moduleId];
-    nativeModule = std::make_unique<NativeModule>(this, moduleId, result, std::move(nativeProtos));
+    std::unique_ptr<NativeModule>& nativeModule = identifiedModules[{moduleId, partition}];
+    nativeModule = std::make_unique<NativeModule>(this, moduleId, result, std::move(nativeProtos), partition);
 
     return {NativeModuleRef{nativeModule.get()}, true};
 }
@@ -291,7 +299,7 @@ void SharedCodeAllocator::eraseNativeModuleIfUnreferenced(const NativeModule& na
 
     if (const std::optional<ModuleId>& moduleId = nativeModule.getModuleId())
     {
-        const auto it = identifiedModules.find(*moduleId);
+        const auto it = identifiedModules.find(ModuleKey{*moduleId, nativeModule.getPartition()});
         CODEGEN_ASSERT(it != identifiedModules.end());
 
         identifiedModules.erase(it);
@@ -303,18 +311,19 @@ void SharedCodeAllocator::eraseNativeModuleIfUnreferenced(const NativeModule& na
     }
 }
 
-[[nodiscard]] NativeModuleRef SharedCodeAllocator::tryGetNativeModuleWithLockHeld(const ModuleId& moduleId) const noexcept
+[[nodiscard]] NativeModuleRef SharedCodeAllocator::tryGetNativeModuleWithLockHeld(const ModuleKey& key) const noexcept
 {
-    const auto it = identifiedModules.find(moduleId);
+    const auto it = identifiedModules.find(key);
     if (it == identifiedModules.end())
         return NativeModuleRef{};
 
     return NativeModuleRef{it->second.get()};
 }
 
-[[nodiscard]] size_t SharedCodeAllocator::ModuleIdHash::operator()(const ModuleId& moduleId) const noexcept
+[[nodiscard]] size_t SharedCodeAllocator::ModuleIdHash::operator()(const ModuleKey& key) const noexcept
 {
-    return std::hash<std::string_view>{}(std::string_view{reinterpret_cast<const char*>(moduleId.data()), moduleId.size()});
+    const ModuleId& moduleId = key.first;
+    return std::hash<std::string_view>{}(std::string_view{reinterpret_cast<const char*>(moduleId.data()), moduleId.size()}) ^ key.second;
 }
 
 } // namespace CodeGen

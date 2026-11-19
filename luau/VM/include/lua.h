@@ -129,6 +129,11 @@ typedef unsigned lua_Unsigned;
 /*
 ** state manipulation
 */
+// With DFFlag::LuauLongStringHash (the default in this fork), each state hashes strings of 32 bytes or more with its own
+// random key, and salts its string interning table at random, so that a script can't choose strings that collide.
+// Iteration order (next, pairs) over tables with such string keys, and so over the other keys of those tables, differs
+// between states and between runs. A nonzero DFInt::LuauStringHashSeed, read when a state is created, gives every state
+// the same key and salt and a reproducible order: for tests and embedders that need one, not for untrusted code.
 LUA_API lua_State* lua_newstate(lua_Alloc allocator, void* ud);
 LUA_API void lua_close(lua_State* L);
 LUA_API lua_State* lua_newthread(lua_State* L);

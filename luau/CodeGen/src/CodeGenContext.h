@@ -84,12 +84,15 @@ public:
 
     [[nodiscard]] bool initHeaderFunctions();
 
+    // L is the state that compiles: native code is shared only between states that hash strings the same way
     [[nodiscard]] virtual std::optional<ModuleBindResult> tryBindExistingModule(
+        lua_State* L,
         const ModuleId& moduleId,
         const std::vector<Proto*>& moduleProtos
     ) = 0;
 
     [[nodiscard]] virtual ModuleBindResult bindModule(
+        lua_State* L,
         const std::optional<ModuleId>& moduleId,
         const std::vector<Proto*>& moduleProtos,
         std::vector<NativeProtoExecDataPtr> nativeExecDatas,
@@ -120,9 +123,14 @@ class StandaloneCodeGenContext final : public BaseCodeGenContext
 public:
     StandaloneCodeGenContext(size_t blockSize, size_t maxTotalSize, AllocationCallback* allocationCallback, void* allocationCallbackContext);
 
-    [[nodiscard]] std::optional<ModuleBindResult> tryBindExistingModule(const ModuleId& moduleId, const std::vector<Proto*>& moduleProtos) override;
+    [[nodiscard]] std::optional<ModuleBindResult> tryBindExistingModule(
+        lua_State* L,
+        const ModuleId& moduleId,
+        const std::vector<Proto*>& moduleProtos
+    ) override;
 
     [[nodiscard]] ModuleBindResult bindModule(
+        lua_State* L,
         const std::optional<ModuleId>& moduleId,
         const std::vector<Proto*>& moduleProtos,
         std::vector<NativeProtoExecDataPtr> nativeProtos,
@@ -148,9 +156,14 @@ class SharedCodeGenContext final : public BaseCodeGenContext
 public:
     SharedCodeGenContext(size_t blockSize, size_t maxTotalSize, AllocationCallback* allocationCallback, void* allocationCallbackContext);
 
-    [[nodiscard]] std::optional<ModuleBindResult> tryBindExistingModule(const ModuleId& moduleId, const std::vector<Proto*>& moduleProtos) override;
+    [[nodiscard]] std::optional<ModuleBindResult> tryBindExistingModule(
+        lua_State* L,
+        const ModuleId& moduleId,
+        const std::vector<Proto*>& moduleProtos
+    ) override;
 
     [[nodiscard]] ModuleBindResult bindModule(
+        lua_State* L,
         const std::optional<ModuleId>& moduleId,
         const std::vector<Proto*>& moduleProtos,
         std::vector<NativeProtoExecDataPtr> nativeProtos,

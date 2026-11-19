@@ -1925,9 +1925,12 @@ void lua_setpointerencodekey(lua_State* L, uint64_t a, uint64_t b, uint64_t c, u
     }
 
     // Derive an additional key for the string interning table
-    if (FFlag::LuauSaltedInterningTable && g->ptrencactive)
+    if ((FFlag::LuauSaltedInterningTable || g->strt.longhash) && g->ptrencactive)
     {
         uint64_t salt = siphash24(a, b, 4);
+        // with DFFlag::LuauLongStringHash, mixed with the VM's own secret, so that the host's key can't make it known
+        if (g->strt.longhash)
+            salt = luaS_keyedsalt(g, salt);
         luaS_sethashsalt(L, uint32_t(salt), uint32_t(salt >> 32));
     }
 }

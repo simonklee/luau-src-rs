@@ -50,7 +50,8 @@ public:
         SharedCodeAllocator* allocator,
         const std::optional<ModuleId>& moduleId,
         CodeAllocationData codeAllocationData,
-        std::vector<NativeProtoExecDataPtr> nativeProtos
+        std::vector<NativeProtoExecDataPtr> nativeProtos,
+        uint8_t partition = 0
     ) noexcept;
 
     NativeModule(const NativeModule&) = delete;
@@ -70,6 +71,9 @@ public:
 
     [[nodiscard]] const std::optional<ModuleId>& getModuleId() const noexcept;
 
+    // The partition of the SharedCodeAllocator that holds an identified module (see SharedCodeAllocator)
+    [[nodiscard]] uint8_t getPartition() const noexcept;
+
     // Gets the base address of the executable native code for the module.
     [[nodiscard]] const uint8_t* getModuleBaseAddress() const noexcept;
 
@@ -87,6 +91,7 @@ private:
 
     SharedCodeAllocator* allocator = nullptr;
     std::optional<ModuleId> moduleId = {};
+    uint8_t partition = 0;
     CodeAllocationData codeAllocationData;
 
     std::vector<NativeProtoExecDataPtr> nativeProtos = {};
@@ -133,9 +138,16 @@ public:
 
     ~SharedCodeAllocator() noexcept;
 
+    // Identified modules are looked up by ModuleId within a partition: modules
+    // with the same ModuleId in different partitions are different modules.
+    // SharedCodeGenContext uses the partition to keep apart code compiled for
+    // VMs that hash strings differently (DFFlag::LuauShortStringHash), since
+    // native code bakes in string hashes.  All partitions share one mutex and
+    // one CodeAllocator.
+
     // If we have a NativeModule for the given ModuleId, an owning reference to
     // it is returned.  Otherwise, an empty NativeModuleRef is returned.
-    [[nodiscard]] NativeModuleRef tryGetNativeModule(const ModuleId& moduleId) const noexcept;
+    [[nodiscard]] NativeModuleRef tryGetNativeModule(const ModuleId& moduleId, uint8_t partition = 0) const noexcept;
 
     // If we have a NativeModule for the given ModuleId, an owning reference to
     // it is returned.  Otherwise, a new NativeModule is created for that ModuleId
@@ -149,7 +161,8 @@ public:
         const uint8_t* data,
         size_t dataSize,
         const uint8_t* code,
-        size_t codeSize
+        size_t codeSize,
+        uint8_t partition = 0
     );
 
     NativeModuleRef insertAnonymousNativeModule(
@@ -167,16 +180,18 @@ public:
     void eraseNativeModuleIfUnreferenced(const NativeModule& nativeModule);
 
 private:
+    using ModuleKey = std::pair<ModuleId, uint8_t>; // ModuleId and partition
+
     struct ModuleIdHash
     {
-        [[nodiscard]] size_t operator()(const ModuleId& moduleId) const noexcept;
+        [[nodiscard]] size_t operator()(const ModuleKey& key) const noexcept;
     };
 
-    [[nodiscard]] NativeModuleRef tryGetNativeModuleWithLockHeld(const ModuleId& moduleId) const noexcept;
+    [[nodiscard]] NativeModuleRef tryGetNativeModuleWithLockHeld(const ModuleKey& key) const noexcept;
 
     mutable std::mutex mutex;
 
-    std::unordered_map<ModuleId, std::unique_ptr<NativeModule>, ModuleIdHash, std::equal_to<>> identifiedModules;
+    std::unordered_map<ModuleKey, std::unique_ptr<NativeModule>, ModuleIdHash, std::equal_to<>> identifiedModules;
 
     std::atomic<size_t> anonymousModuleCount = 0;
 

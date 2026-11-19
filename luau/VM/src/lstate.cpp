@@ -11,6 +11,8 @@
 #include "ldebug.h"
 #include "ludata.h"
 
+#include "Luau/StringHash.h"
+
 #include <string.h>
 
 LUAU_FASTFLAG(LuauGcTraceUdata)
@@ -215,6 +217,8 @@ lua_State* lua_newstate(lua_Alloc allocator, void* ud)
     g->ptrenckey[0] = 1;
 
     g->strt.saltmult = 0x9e3779b9u; // default string table salt provides additional Fibonacci hash mixing
+    g->strt.wordhash = DFFlag::LuauShortStringHash;
+    luaS_initlonghash(g); // DFFlag::LuauLongStringHash
 
     g->totalbytes = sizeof(LG);
     g->memcatbytes[0] = sizeof(LG);

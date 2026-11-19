@@ -2535,6 +2535,17 @@ bool translateInstNamecall(IrBuilder& build, const Instruction* pc, int pcpos)
         }
     }
 
+    // The fast path below bakes in the method name's hash. A state with keyed long strings (DFFlag::LuauLongStringHash)
+    // hashes a name of 32 bytes or more with its own random key, which another state sharing this code doesn't have
+    if (build.function.envInfo.keyedLongStrings && gco2ts(build.function.proto->k[aux].value.gc)->len >= 32)
+    {
+        if (FFlag::LuauCodegenUserdataDirect)
+            return emitNamecallSequence(build, isUdata, pcpos, ra, rb, aux, nparams, nresults);
+
+        build.inst(IrCmd::FALLBACK_NAMECALL, build.constUint(pcpos), build.vmReg(ra), build.vmReg(rb), build.vmConst(aux));
+        return false;
+    }
+
     IrOp next = build.blockAtInst(pcpos + getOpLength(LuauOpcode(LOP_NAMECALL)));
     IrOp fallback = build.fallbackBlock(pcpos);
     IrOp nonTableFallback = fallback;

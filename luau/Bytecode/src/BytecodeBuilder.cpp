@@ -4,6 +4,7 @@
 #include "Luau/Bytecode.h"
 #include "Luau/BytecodeUtils.h"
 #include "Luau/SmallVector.h"
+#include "Luau/StringHash.h"
 #include "Luau/StringUtils.h"
 
 #include <algorithm>
@@ -1183,6 +1184,11 @@ uint32_t BytecodeBuilder::getStringHash(StringRef key)
     // VM independent in terms of compilation/linking. The resulting string hashes are embedded into bytecode binary and result in a better initial
     // guess for the field hashes which improves performance during initial code execution. We omit the long string processing here for simplicity, as
     // it doesn't really matter on long identifiers.
+    // With DFFlag::LuauShortStringHash, the VM states created with the flag on use Luau::wordHash, so the compiler predicts with it
+    // (see Luau/StringHash.h for compiling and loading under different flag values).
+    if (DFFlag::LuauShortStringHash)
+        return wordHash(key.data, key.length);
+
     const char* str = key.data;
     size_t len = key.length;
 
@@ -2388,12 +2394,24 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k, bool detailed) co
             std::vector<unsigned> slotOwner;
             slotOwner.resize(sizenode, ~0u);
 
+            // With DFFlag::LuauLongStringHash the VM hashes a key of 32 bytes or more with its own key: its slot is
+            // unknown here, and so are the conflicts of the table's other keys
+            std::vector<bool> slotKnown(shape.length, true);
+            bool conflictsKnown = true;
+
             for (unsigned i = 0; i < shape.length; ++i)
             {
                 const Constant& keyConst = constants[shape.keys[i]];
                 LUAU_ASSERT(keyConst.type == Constant::Type_String);
                 LUAU_ASSERT(keyConst.valueString != 0u);
                 const StringRef& str = debugStrings[keyConst.valueString - 1];
+
+                if (isStringHashKeyed(str.length))
+                {
+                    slotKnown[i] = false;
+                    conflictsKnown = false;
+                    continue;
+                }
 
                 slots[i] = getStringHash(str) & mask;
 
@@ -2418,9 +2436,12 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k, bool detailed) co
                     dumpConstant(result, shape.constants[i], false);
                 }
 
-                formatAppend(result, " #%u", slots[i]);
+                if (!slotKnown[i])
+                    formatAppend(result, " #?");
+                else
+                    formatAppend(result, " #%u", slots[i]);
 
-                if (slotOwner[slots[i]] != i)
+                if (slotKnown[i] && conflictsKnown && slotOwner[slots[i]] != i)
                     formatAppend(result, " (conflict)");
             }
 

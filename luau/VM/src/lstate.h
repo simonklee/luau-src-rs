@@ -25,6 +25,9 @@ typedef struct stringtable
     uint32_t saltmult;
     uint32_t saltadd;
     uint8_t hashshift;
+    bool wordhash; // luaS_wordhash instead of luaS_hash (DFFlag::LuauShortStringHash when the VM was created)
+    bool longhash; // with wordhash: keyed long strings and a random salt (DFFlag::LuauLongStringHash when the VM was created)
+    uint64_t longkey[2]; // with longhash: the SipHash key of strings of 32 bytes or more, random for each VM
 } stringtable;
 // clang-format on
 

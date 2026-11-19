@@ -25,6 +25,10 @@
     }
 
 LUAI_FUNC unsigned int luaS_hash(const char* str, size_t len);
+LUAI_FUNC unsigned int luaS_wordhash(const char* str, size_t len);
+LUAI_FUNC unsigned int luaS_longhash(const uint64_t key[2], const char* str, size_t len);
+LUAI_FUNC void luaS_initlonghash(global_State* g);
+LUAI_FUNC uint64_t luaS_keyedsalt(global_State* g, uint64_t hostsalt);
 
 LUAI_FUNC void luaS_resize(lua_State* L, int newsize);
 LUAI_FUNC void luaS_sethashsalt(lua_State* L, uint32_t saltmult, uint32_t saltadd);
