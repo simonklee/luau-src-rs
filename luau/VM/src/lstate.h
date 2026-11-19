@@ -28,8 +28,38 @@ typedef struct stringtable
     bool wordhash; // luaS_wordhash instead of luaS_hash (DFFlag::LuauShortStringHash when the VM was created)
     bool longhash; // with wordhash: keyed long strings and a random salt (DFFlag::LuauLongStringHash when the VM was created)
     uint64_t longkey[2]; // with longhash: the SipHash key of strings of 32 bytes or more, random for each VM
+    bool keyedtables; // with longhash: keyed short strings and table main positions (DFFlag::LuauTableKeyedHash when the VM was created)
+    uint64_t tablekey[2]; // with keyedtables: the key of luaH_keymix, random for each VM; tablekey[1] is odd
+    uint64_t shortkey[2]; // with keyedtables: the key of luaS_keyshort, drawn apart from tablekey so that one can't give the other
 } stringtable;
 // clang-format on
+
+// The keyed mix of DFFlag::LuauTableKeyedHash: a table's main position for a number, vector or pointer key is its low
+// bits. For each key it is a bijection of x: an xor with the key, a multiply by the key's odd word, and xorshift-multiply
+// steps with splitmix64's constant, so every bit of x reaches the low bits. A plugin can't compute it without the key,
+// so it can't choose colliding keys offline. It isn't a PRF: a plugin that sees table order learns some low bits of it,
+// and resize (ltable.cpp) stays linear even if the key were known.
+static inline uint64_t luaH_keymix(const uint64_t key[2], uint64_t x)
+{
+    uint64_t h = x ^ key[0];
+    h ^= h >> 32;
+    h *= key[1];
+    h ^= h >> 29;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 32;
+    return h;
+}
+
+// The keyed hash of a string under 32 bytes with DFFlag::LuauTableKeyedHash, from its unkeyed 32-bit hash v: a
+// multiply-add-shift under its own key's two words, (a * v + b) mod 2^64 >> 32, which is universal: over random keys, two
+// distinct v share a main position about as often as two random values. Three operations, where luaH_keymix takes ten:
+// a 32-bit input needs no folding. Strings whose unkeyed hashes are equal keep equal hashes; each costs 2^32 tries. Being
+// linear, its key shows through table order (a plugin can recover most of it from pairs), so it's stringtable::shortkey,
+// derived apart from luaH_keymix's tablekey.
+static inline uint32_t luaS_keyshort(const uint64_t key[2], uint32_t v)
+{
+    return uint32_t((key[1] * uint64_t(v) + key[0]) >> 32);
+}
 
 /*
 ** information about a call

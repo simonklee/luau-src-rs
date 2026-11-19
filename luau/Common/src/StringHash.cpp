@@ -4,3 +4,4 @@
 // In Common, which both the VM and the compiler link, so that each can read it (see StringHash.h)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauShortStringHash, true)
 LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauLongStringHash, true)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauTableKeyedHash, true)

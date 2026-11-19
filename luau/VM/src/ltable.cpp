@@ -30,6 +30,7 @@
 #include "lgc.h"
 #include "lmem.h"
 #include "lnumutils.h"
+#include "lstate.h"
 #include "ltm.h"
 
 #include <string.h>
@@ -65,8 +66,16 @@ const LuaNode luaH_dummynode = {
 #define hashstr(t, str) hashpow2(t, (ALT_HASH_FUNCTION ? 0x87654321 : 0) ^ (str)->hash)
 #define hashboolean(t, p) hashpow2(t, (ALT_HASH_FUNCTION ? 0x87654321 : 0) ^ p)
 
-static LuaNode* hashpointer(const LuaTable* t, const void* p)
+// With DFFlag::LuauTableKeyedHash (stringtable::keyedtables), the main position of a number, vector or pointer key is
+// keyed with the VM's secret (luaH_keymix), and a string's stored hash is keyed when it's interned (lstring.cpp), so no
+// key's main position can be computed outside the VM. 747's hashes are public bijections: a plugin could invert hashnum
+// in O(1), and find short strings or objects (tostring shows addresses) for any main position, to put a table's keys in
+// one chain.
+static LuaNode* hashpointer(const global_State* g, const LuaTable* t, const void* p)
 {
+    if (g->strt.keyedtables)
+        return hashpow2(t, uint32_t(luaH_keymix(g->strt.tablekey, uint64_t(uintptr_t(p)))));
+
     // we discard the high 32-bit portion of the pointer on 64-bit platforms as it doesn't carry much entropy anyway
     unsigned int h = unsigned(uintptr_t(p));
 
@@ -83,9 +92,11 @@ static LuaNode* hashpointer(const LuaTable* t, const void* p)
     return hashpow2(t, h);
 }
 
-static LuaNode* hashnum(const LuaTable* t, double n)
+// 747's number hash, without the VM's key
+static LuaNode* hashnumunkeyed(const LuaTable* t, double n)
 {
     static_assert(sizeof(double) == sizeof(unsigned int) * 2, "expected a 8-byte double");
+
     unsigned int i[2];
     memcpy(i, &n, sizeof(i));
 
@@ -112,7 +123,21 @@ static LuaNode* hashnum(const LuaTable* t, double n)
     return hashpow2(t, h2);
 }
 
-LUAU_MAYBE_UNUSED static LuaNode* hashvec(const LuaTable* t, const float* v)
+static LuaNode* hashnum(const global_State* g, const LuaTable* t, double n)
+{
+    if (g->strt.keyedtables)
+    {
+        uint64_t u;
+        memcpy(&u, &n, sizeof(u));
+
+        // mask out sign bit to make sure -0 and 0 hash to the same value
+        return hashpow2(t, uint32_t(luaH_keymix(g->strt.tablekey, u & 0x7fffffffffffffffull)));
+    }
+
+    return hashnumunkeyed(t, n);
+}
+
+LUAU_MAYBE_UNUSED static LuaNode* hashvec(const global_State* g, const LuaTable* t, const float* v)
 {
     unsigned int i[LUA_VECTOR_SIZE];
     memcpy(i, v, sizeof(i));
@@ -121,6 +146,17 @@ LUAU_MAYBE_UNUSED static LuaNode* hashvec(const LuaTable* t, const float* v)
     i[0] = (i[0] == 0x80000000) ? 0 : i[0];
     i[1] = (i[1] == 0x80000000) ? 0 : i[1];
     i[2] = (i[2] == 0x80000000) ? 0 : i[2];
+
+    if (g->strt.keyedtables)
+    {
+        // two steps of the 64-bit bijection, so that no linear combination of the components collides for every key
+        uint64_t rest = i[2];
+#if LUA_VECTOR_SIZE == 4
+        rest |= uint64_t((i[3] == 0x80000000) ? 0 : i[3]) << 32;
+#endif
+        uint64_t h = luaH_keymix(g->strt.tablekey, uint64_t(i[0]) | (uint64_t(i[1]) << 32));
+        return hashpow2(t, uint32_t(luaH_keymix(g->strt.tablekey, h ^ rest)));
+    }
 
     // scramble bits to make sure that integer coordinates have entropy in lower bits
     if (!ALT_HASH_FUNCTION)
@@ -142,7 +178,7 @@ LUAU_MAYBE_UNUSED static LuaNode* hashvec(const LuaTable* t, const float* v)
     return hashpow2(t, h);
 }
 
-static LUAU_MAYBE_UNUSED LuaNode* hashvec(const LuaTable* t, const double* v)
+static LUAU_MAYBE_UNUSED LuaNode* hashvec(const global_State* g, const LuaTable* t, const double* v)
 {
     uint64_t i[LUA_VECTOR_SIZE];
     memcpy(i, v, sizeof(i));
@@ -151,6 +187,17 @@ static LUAU_MAYBE_UNUSED LuaNode* hashvec(const LuaTable* t, const double* v)
     i[0] = (i[0] == 0x8000000000000000ull) ? 0 : i[0];
     i[1] = (i[1] == 0x8000000000000000ull) ? 0 : i[1];
     i[2] = (i[2] == 0x8000000000000000ull) ? 0 : i[2];
+
+    if (g->strt.keyedtables)
+    {
+        uint64_t h = luaH_keymix(g->strt.tablekey, i[0]);
+        h = luaH_keymix(g->strt.tablekey, h ^ i[1]);
+        h = luaH_keymix(g->strt.tablekey, h ^ i[2]);
+#if LUA_VECTOR_SIZE == 4
+        h = luaH_keymix(g->strt.tablekey, h ^ ((i[3] == 0x8000000000000000ull) ? 0 : i[3]));
+#endif
+        return hashpow2(t, uint32_t(h));
+    }
 
     // scramble bits to make sure that integer coordinates have entropy in lower bits
     if (!ALT_HASH_FUNCTION)
@@ -176,22 +223,22 @@ static LUAU_MAYBE_UNUSED LuaNode* hashvec(const LuaTable* t, const double* v)
 ** returns the `main' position of an element in a table (that is, the index
 ** of its hash value)
 */
-static LuaNode* mainposition(const LuaTable* t, const TValue* key)
+static LuaNode* mainposition(const global_State* g, const LuaTable* t, const TValue* key)
 {
     switch (ttype(key))
     {
     case LUA_TNUMBER:
-        return hashnum(t, nvalue(key));
+        return hashnum(g, t, nvalue(key));
     case LUA_TVECTOR:
-        return hashvec(t, vvalue(key));
+        return hashvec(g, t, vvalue(key));
     case LUA_TSTRING:
         return hashstr(t, tsvalue(key));
     case LUA_TBOOLEAN:
         return hashboolean(t, bvalue(key));
     case LUA_TLIGHTUSERDATA:
-        return hashpointer(t, pvalue(key));
+        return hashpointer(g, t, pvalue(key));
     default:
-        return hashpointer(t, gcvalue(key));
+        return hashpointer(g, t, gcvalue(key));
     }
 }
 
@@ -199,42 +246,42 @@ static const int LUA_TGCO = -1; // Marker for template dispatch into a generic G
 
 // For static mainposition dispatch on a known tag (or GCO)
 template<int Tag, typename T>
-static LUAU_FORCEINLINE LuaNode* mainpositiontagged(const LuaTable* t, T key) = delete;
+static LUAU_FORCEINLINE LuaNode* mainpositiontagged(const global_State* g, const LuaTable* t, T key) = delete;
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TBOOLEAN>(const LuaTable* t, int key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TBOOLEAN>(const global_State* g, const LuaTable* t, int key)
 {
     return hashboolean(t, key);
 }
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TLIGHTUSERDATA>(const LuaTable* t, void* key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TLIGHTUSERDATA>(const global_State* g, const LuaTable* t, void* key)
 {
-    return hashpointer(t, key);
+    return hashpointer(g, t, key);
 }
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TNUMBER>(const LuaTable* t, double key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TNUMBER>(const global_State* g, const LuaTable* t, double key)
 {
-    return hashnum(t, key);
+    return hashnum(g, t, key);
 }
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TVECTOR>(const LuaTable* t, const LUA_VECTOR_TYPE* key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TVECTOR>(const global_State* g, const LuaTable* t, const LUA_VECTOR_TYPE* key)
 {
-    return hashvec(t, key);
+    return hashvec(g, t, key);
 }
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TSTRING>(const LuaTable* t, TString* key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TSTRING>(const global_State* g, const LuaTable* t, TString* key)
 {
     return hashstr(t, key);
 }
 
 template<>
-LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TGCO>(const LuaTable* t, GCObject* key)
+LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TGCO>(const global_State* g, const LuaTable* t, GCObject* key)
 {
-    return hashpointer(t, key);
+    return hashpointer(g, t, key);
 }
 
 // TODO: remove with FFlagLuauTableFindImprovement
@@ -268,9 +315,9 @@ LUAU_FORCEINLINE int rawequalkeyvalue<LUA_TGCO>(const TKey* t1, GCObject* key)
 
 // Lookup a node in the main position of the key or look through the node chain
 template<int Tag, typename T>
-static LUAU_FORCEINLINE const TValue* chainsearchtagged_DEPRECATED(const LuaTable* t, T key, int keytag)
+static LUAU_FORCEINLINE const TValue* chainsearchtagged_DEPRECATED(const global_State* g, const LuaTable* t, T key, int keytag)
 {
-    LuaNode* n = mainpositiontagged<Tag>(t, key);
+    LuaNode* n = mainpositiontagged<Tag>(g, t, key);
 
     // check whether `key' is somewhere in the chain
     for (;;)
@@ -328,9 +375,9 @@ LUAU_FORCEINLINE int rawequalvalue(const Obj* lhs, GCObject* rhs)
 
 // Lookup a node in the main position of the key or look through the node chain
 template<int Tag, typename T>
-static LUAU_FORCEINLINE const TValue* chainsearchtagged(const LuaTable* t, T key, int keytag)
+static LUAU_FORCEINLINE const TValue* chainsearchtagged(const global_State* g, const LuaTable* t, T key, int keytag)
 {
-    LuaNode* n = mainpositiontagged<Tag>(t, key);
+    LuaNode* n = mainpositiontagged<Tag>(g, t, key);
 
     // check whether `key' is somewhere in the chain
     for (;;)
@@ -365,11 +412,11 @@ static int rawfindarray(const LuaTable* t, int startpos, T value, int valuetag)
     return 0;
 }
 
-static LUAU_NOINLINE int rawfindnode(const LuaTable* t, int startpos, const TValue* value)
+static LUAU_NOINLINE int rawfindnode(const global_State* g, const LuaTable* t, int startpos, const TValue* value)
 {
     for (int i = startpos;; i++)
     {
-        const TValue* e = chainsearchtagged<LUA_TNUMBER>(t, cast_num(i), LUA_TNUMBER);
+        const TValue* e = chainsearchtagged<LUA_TNUMBER>(g, t, cast_num(i), LUA_TNUMBER);
 
         if (ttisnil(e))
             return 0;
@@ -412,7 +459,7 @@ static int findindex(lua_State* L, LuaTable* t, StkId key)
         return i - 1;               // yes; that's the index (corrected to C)
     else
     {
-        LuaNode* n = mainposition(t, key);
+        LuaNode* n = mainposition(L->global, t, key);
         for (;;)
         { // check whether `key' is somewhere in the chain
             // key may be dead already, but it is ok to use it in `next'
@@ -454,7 +501,7 @@ int luaH_next(lua_State* L, LuaTable* t, StkId key)
     return 0; // no more elements
 }
 
-int luaH_rawfind(LuaTable* t, int startpos, StkId value)
+int luaH_rawfind(lua_State* L, LuaTable* t, int startpos, StkId value)
 {
     // If we start outside the array part, we only need to check the hash part
     if (LUAU_UNLIKELY(unsigned(startpos) - 1 >= unsigned(t->sizearray)))
@@ -462,7 +509,7 @@ int luaH_rawfind(LuaTable* t, int startpos, StkId value)
         if (t->node == dummynode || startpos < 1)
             return 0;
 
-        return rawfindnode(t, startpos, value);
+        return rawfindnode(L->global, t, startpos, value);
     }
 
     int index = 0;
@@ -644,6 +691,67 @@ static void setnodevector(lua_State* L, LuaTable* t, int size)
 
 static TValue* reinsertkey(lua_State* L, LuaTable* t, const TValue* key, bool checkarraypart);
 
+// The first of resize's two passes with DFFlag::LuauTableKeyedHash: moves each element whose key goes to the new array
+// part or to a free main position, and clears it in the old storage, which resize frees. After it, every main position
+// of a key left is held by a key in its own main position, and a free slot is no key's main position. So the second
+// pass (resize's loops, reinsertkey) chains each key left into a free slot after its main position in O(1), and never
+// moves a colliding node out of a slot, which walks that node's chain: with keys sharing main positions, one pass can
+// do that for most keys, O(n^2) with no interrupt. Keyed main positions keep such keys from being chosen; this keeps
+// resize linear even for a plugin that learns the key.
+static void reinsertfree(lua_State* L, LuaTable* t, TValue* oldarray, int nasize, int oldsizearray, LuaNode* oldnode, int oldsizenode)
+{
+    if (t->node == dummynode)
+        return;
+
+    for (int i = nasize; i < oldsizearray; i++)
+    {
+        if (!ttisnil(&oldarray[i]))
+        {
+            TValue ok;
+            setnvalue(&ok, cast_num(i + 1));
+            LuaNode* mp = mainposition(L->global, t, &ok);
+            if (ttisnil(gkey(mp)))
+            {
+                setnodekey(L, mp, &ok);
+                setobjt2t(L, gval(mp), &oldarray[i]);
+                setnilvalue(&oldarray[i]);
+            }
+        }
+    }
+
+    for (int i = oldsizenode - 1; i >= 0; i--)
+    {
+        LuaNode* old = oldnode + i;
+        if (!ttisnil(gval(old)))
+        {
+            TValue ok;
+            getnodekey(L, &ok, old);
+
+            if (ttisnumber(&ok))
+            {
+                int k;
+                double n = nvalue(&ok);
+                luai_num2int(k, n);
+                if (luai_numeq(cast_num(k), n) && unsigned(k) - 1 < unsigned(t->sizearray))
+                {
+                    setobjt2t(L, &t->array[k - 1], gval(old));
+                    setnilvalue(gval(old));
+                    continue;
+                }
+            }
+
+            LuaNode* mp = mainposition(L->global, t, &ok);
+            if (ttisnil(gkey(mp)))
+            {
+                setnodekey(L, mp, &ok);
+                luaC_barriert(L, t, &ok);
+                setobjt2t(L, gval(mp), gval(old));
+                setnilvalue(gval(old));
+            }
+        }
+    }
+}
+
 static void resize(lua_State* L, LuaTable* t, int nasize, int nhsize)
 {
     LUAU_ASSERT(!hasmetacache(t));
@@ -731,6 +839,10 @@ static void resize(lua_State* L, LuaTable* t, int nasize, int nhsize)
     t->nodemask8 = cast_byte((1 << lsizenode) - 1);
     t->lastfree = nhsize; // all positions are free
 
+    // with keyed main positions, first move each element whose main position is free (see reinsertfree)
+    if (L->global->strt.keyedtables)
+        reinsertfree(L, t, oldarray, nasize, oldsizearray, oldnode, oldsizenode);
+
     // re-insert elements from vanishing array slice
     for (int i = nasize; i < oldsizearray; i++)
     {
@@ -769,11 +881,11 @@ static void resize(lua_State* L, LuaTable* t, int nasize, int nhsize)
 }
 
 // When we already know that new key is an integer number
-static int adjustasize(LuaTable* t, int size, int extraintkey)
+static int adjustasize(lua_State* L, LuaTable* t, int size, int extraintkey)
 {
     bool tbound = t->node != dummynode || size < t->sizearray;
     // move the array size up until the boundary is guaranteed to be inside the array part
-    while (size + 1 == extraintkey || (tbound && !ttisnil(luaH_getnum(t, size + 1))))
+    while (size + 1 == extraintkey || (tbound && !ttisnil(luaH_getnum(L, t, size + 1))))
         size++;
     return size;
 }
@@ -784,7 +896,7 @@ void luaH_resizearray(lua_State* L, LuaTable* t, int nasize)
         luaG_runerror(L, "table overflow");
 
     int nsize = (t->node == dummynode) ? 0 : sizenode(t);
-    int asize = adjustasize(t, nasize, -1);
+    int asize = adjustasize(L, t, nasize, -1);
     resize(L, t, asize, nsize);
 }
 
@@ -836,7 +948,7 @@ static void rehash(lua_State* L, LuaTable* t, int newintkey)
     int nh = totaluse - na;
 
     // enforce the boundary invariant; for performance, only do hash lookups if we must
-    int nadjusted = adjustasize(t, nasize, newintkey);
+    int nadjusted = adjustasize(L, t, nasize, newintkey);
 
     // count how many extra elements belong to array part instead of hash part
     int aextra = nadjusted - nasize;
@@ -851,7 +963,7 @@ static void rehash(lua_State* L, LuaTable* t, int newintkey)
         nasize = nadjusted + aextra;
 
         // since the size was changed, it's again important to enforce the boundary invariant at the new size
-        nasize = adjustasize(t, nasize, newintkey);
+        nasize = adjustasize(L, t, nasize, newintkey);
     }
 
     // resize the table to new computed sizes
@@ -918,7 +1030,7 @@ static LuaNode* newcollidingkey(lua_State* L, LuaTable* t, LuaNode* mp, LuaNode*
 
     TValue mk;
     getnodekey(L, &mk, mp);
-    LuaNode* othern = mainposition(t, &mk);
+    LuaNode* othern = mainposition(L->global, t, &mk);
 
     // is colliding node out of its main position?
     if (othern != mp)
@@ -974,7 +1086,7 @@ static LUAU_NOINLINE TValue* newkeytagged(lua_State* L, LuaTable* t, const TValu
         return newkeytagged<Tag, IsIntKey>(L, t, key, hashkey, newintkey);
     }
 
-    LuaNode* mp = mainpositiontagged<Tag>(t, hashkey);
+    LuaNode* mp = mainpositiontagged<Tag>(L->global, t, hashkey);
 
     if (!ttisnil(gval(mp)) || mp == dummynode)
     {
@@ -1016,7 +1128,7 @@ static TValue* reinsertkey(lua_State* L, LuaTable* t, const TValue* key, bool ch
             return &t->array[k - 1];
     }
 
-    LuaNode* mp = mainposition(t, key);
+    LuaNode* mp = mainposition(L->global, t, key);
 
     if (!ttisnil(gval(mp)) || mp == dummynode)
         mp = newcollidingkey(L, t, mp, getfreepos(t));
@@ -1030,7 +1142,7 @@ static TValue* reinsertkey(lua_State* L, LuaTable* t, const TValue* key, bool ch
 /*
 ** search function for integers
 */
-const TValue* luaH_getnum(LuaTable* t, int key)
+const TValue* luaH_getnum(lua_State* L, LuaTable* t, int key)
 {
     // (1 <= key && key <= t->sizearray)
     if (unsigned(key) - 1 < unsigned(t->sizearray))
@@ -1038,7 +1150,7 @@ const TValue* luaH_getnum(LuaTable* t, int key)
     else if (t->node != dummynode)
     {
         double nk = cast_num(key);
-        LuaNode* n = hashnum(t, nk);
+        LuaNode* n = hashnum(L->global, t, nk);
         for (;;)
         { // check whether `key' is somewhere in the chain
             if (ttisnumber(gkey(n)) && luai_numeq(nvalue(gkey(n)), nk))
@@ -1073,9 +1185,9 @@ const TValue* luaH_getstr(LuaTable* t, TString* key)
 /*
 ** search function for lightuserdata
 */
-const TValue* luaH_getp(LuaTable* t, void* key, int tag)
+const TValue* luaH_getp(lua_State* L, LuaTable* t, void* key, int tag)
 {
-    LuaNode* n = hashpointer(t, key);
+    LuaNode* n = hashpointer(L->global, t, key);
     for (;;)
     { // check whether `key' is somewhere in the chain
         const TKey* nk = gkey(n);
@@ -1091,8 +1203,9 @@ const TValue* luaH_getp(LuaTable* t, void* key, int tag)
 /*
 ** main search function
 */
-const TValue* luaH_get(LuaTable* t, const TValue* key)
+const TValue* luaH_get(lua_State* L, LuaTable* t, const TValue* key)
 {
+    const global_State* g = L->global;
     if (DFFlag::LuauTableFindImprovement)
     {
         switch (ttype(key))
@@ -1100,25 +1213,25 @@ const TValue* luaH_get(LuaTable* t, const TValue* key)
         case LUA_TNIL:
             return luaO_nilobject;
         case LUA_TBOOLEAN:
-            return chainsearchtagged<LUA_TBOOLEAN>(t, bvalue(key), LUA_TBOOLEAN);
+            return chainsearchtagged<LUA_TBOOLEAN>(g, t, bvalue(key), LUA_TBOOLEAN);
         case LUA_TLIGHTUSERDATA:
-            return luaH_getp(t, pvalue(key), lightuserdatatag(key)); // special search function with tag comparison
+            return luaH_getp(L, t, pvalue(key), lightuserdatatag(key)); // special search function with tag comparison
         case LUA_TNUMBER:
         {
             int k;
             double n = nvalue(key);
             luai_num2int(k, n);
             if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
-                return luaH_getnum(t, k);             // use specialized version
+                return luaH_getnum(L, t, k);          // use specialized version
 
-            return chainsearchtagged<LUA_TNUMBER>(t, nvalue(key), LUA_TNUMBER);
+            return chainsearchtagged<LUA_TNUMBER>(g, t, nvalue(key), LUA_TNUMBER);
         }
         case LUA_TVECTOR:
-            return chainsearchtagged<LUA_TVECTOR>(t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR);
+            return chainsearchtagged<LUA_TVECTOR>(g, t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR);
         case LUA_TSTRING:
             return luaH_getstr(t, tsvalue(key));
         default:
-            return chainsearchtagged<LUA_TGCO>(t, gcvalue(key), ttype(key));
+            return chainsearchtagged<LUA_TGCO>(g, t, gcvalue(key), ttype(key));
         }
     }
     else
@@ -1128,32 +1241,32 @@ const TValue* luaH_get(LuaTable* t, const TValue* key)
         case LUA_TNIL:
             return luaO_nilobject;
         case LUA_TBOOLEAN:
-            return chainsearchtagged_DEPRECATED<LUA_TBOOLEAN>(t, bvalue(key), LUA_TBOOLEAN);
+            return chainsearchtagged_DEPRECATED<LUA_TBOOLEAN>(g, t, bvalue(key), LUA_TBOOLEAN);
         case LUA_TLIGHTUSERDATA:
-            return luaH_getp(t, pvalue(key), lightuserdatatag(key)); // special search function with tag comparison
+            return luaH_getp(L, t, pvalue(key), lightuserdatatag(key)); // special search function with tag comparison
         case LUA_TNUMBER:
         {
             int k;
             double n = nvalue(key);
             luai_num2int(k, n);
             if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
-                return luaH_getnum(t, k);             // use specialized version
+                return luaH_getnum(L, t, k);          // use specialized version
 
-            return chainsearchtagged_DEPRECATED<LUA_TNUMBER>(t, nvalue(key), LUA_TNUMBER);
+            return chainsearchtagged_DEPRECATED<LUA_TNUMBER>(g, t, nvalue(key), LUA_TNUMBER);
         }
         case LUA_TVECTOR:
-            return chainsearchtagged_DEPRECATED<LUA_TVECTOR>(t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR);
+            return chainsearchtagged_DEPRECATED<LUA_TVECTOR>(g, t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR);
         case LUA_TSTRING:
             return luaH_getstr(t, tsvalue(key));
         default:
-            return chainsearchtagged_DEPRECATED<LUA_TGCO>(t, gcvalue(key), ttype(key));
+            return chainsearchtagged_DEPRECATED<LUA_TGCO>(g, t, gcvalue(key), ttype(key));
         }
     }
 }
 
 TValue* luaH_set(lua_State* L, LuaTable* t, const TValue* key)
 {
-    const TValue* p = luaH_get(t, key);
+    const TValue* p = luaH_get(L, t, key);
     invalidateTMcache(t);
     if (p != luaO_nilobject)
         return cast_to(TValue*, p);
@@ -1204,7 +1317,7 @@ TValue* luaH_setnum(lua_State* L, LuaTable* t, int key)
     if (unsigned(key) - 1 < unsigned(t->sizearray))
         return &t->array[key - 1];
     // hash fallback
-    const TValue* p = luaH_getnum(t, key);
+    const TValue* p = luaH_getnum(L, t, key);
     if (p != luaO_nilobject)
         return cast_to(TValue*, p);
     else
@@ -1233,7 +1346,7 @@ TValue* luaH_setstr(lua_State* L, LuaTable* t, TString* key)
 
 TValue* luaH_setp(lua_State* L, LuaTable* t, void* key, int tag)
 {
-    const TValue* p = luaH_getp(t, key, tag);
+    const TValue* p = luaH_getp(L, t, key, tag);
     if (p != luaO_nilobject)
         return cast_to(TValue*, p);
     else
@@ -1261,6 +1374,22 @@ static int updateaboundary(LuaTable* t, int boundary)
     }
 
     return 0;
+}
+
+// For an assertion: whether the chain from the number key's unkeyed main position holds a non-nil value at the key.
+// luaH_getn has no state to read the VM's key from (DFFlag::LuauTableKeyedHash), so it walks 747's chain: in an unkeyed
+// table that's the lookup it always was, O(chain); in a keyed one the walk only visits other chains, and finds the key
+// only if it's there, so it can miss a violation but never report a false one.
+LUAU_MAYBE_UNUSED static bool unkeyedchainhasnum(const LuaTable* t, int key)
+{
+    double nk = cast_num(key);
+    for (const LuaNode* n = hashnumunkeyed(t, nk);; n += gnext(n))
+    {
+        if (ttisnumber(gkey(n)) && luai_numeq(nvalue(gkey(n)), nk) && !ttisnil(gval(n)))
+            return true;
+        if (gnext(n) == 0)
+            return false;
+    }
 }
 
 /*
@@ -1303,7 +1432,7 @@ int luaH_getn(LuaTable* t)
     else
     {
         // validate boundary invariant
-        LUAU_ASSERT(t->node == dummynode || ttisnil(luaH_getnum(t, j + 1)));
+        LUAU_ASSERT(t->node == dummynode || !unkeyedchainhasnum(t, j + 1));
         return j;
     }
 }

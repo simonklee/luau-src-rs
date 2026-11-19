@@ -296,9 +296,14 @@ SharedCodeGenContext::SharedCodeGenContext(
 // identified modules are kept apart by the state's string hash (stringtable::wordhash, DFFlag::LuauShortStringHash):
 // a partition of the one SharedCodeAllocator, under its one mutex. A state with keyed long strings
 // (stringtable::longhash, DFFlag::LuauLongStringHash) bakes in no hash of a long string, so such states share modules
-// with each other, whatever their keys, but not with word-hash states, which do bake them in.
+// with each other, whatever their keys, but not with word-hash states, which do bake them in. A state that also keys
+// short strings (stringtable::keyedtables, DFFlag::LuauTableKeyedHash) bakes in no string hash at all; it gets a fourth
+// partition, so that it never binds a module that bakes in an unkeyed short hash.
 static uint8_t modulePartition(lua_State* L)
 {
+    if (L->global->strt.keyedtables)
+        return 3;
+
     if (L->global->strt.longhash)
         return 2;
 
@@ -1323,6 +1328,7 @@ template<typename AssemblyBuilder>
     envInfo.hasPcall = L->global->builtinPcall != nullptr;
     envInfo.hasXpcall = L->global->builtinXpcall != nullptr;
     envInfo.keyedLongStrings = L->global->strt.longhash;
+    envInfo.keyedShortStrings = L->global->strt.keyedtables;
 
     CompilationResult compilationResult;
 

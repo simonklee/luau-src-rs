@@ -130,10 +130,15 @@ typedef unsigned lua_Unsigned;
 ** state manipulation
 */
 // With DFFlag::LuauLongStringHash (the default in this fork), each state hashes strings of 32 bytes or more with its own
-// random key, and salts its string interning table at random, so that a script can't choose strings that collide.
-// Iteration order (next, pairs) over tables with such string keys, and so over the other keys of those tables, differs
-// between states and between runs. A nonzero DFInt::LuauStringHashSeed, read when a state is created, gives every state
-// the same key and salt and a reproducible order: for tests and embedders that need one, not for untrusted code.
+// random key, and salts its string interning table at random, so that a script can't choose strings that collide. With
+// DFFlag::LuauTableKeyedHash (also the default), it also keys every string's hash and the main positions of number,
+// vector and pointer keys. So iteration order (next, pairs) over a table's hash part can differ between states and
+// between runs. A nonzero DFInt::LuauStringHashSeed, read when a state is created, gives every state the same keys and
+// salt: tables made with the same initial sizes, given the same keys by the same inserts and removals in the same order,
+// then iterate in the same order. That holds for strings, numbers, vectors and booleans. It doesn't hold for keys hashed
+// by address (tables, functions, userdata, threads, buffers), whose addresses differ between runs, nor for light userdata
+// unless the host passes the same pointers; nor, then, for the order of a table that mixes such keys with others. For
+// tests and embedders that need a reproducible order, not for untrusted code.
 LUA_API lua_State* lua_newstate(lua_Alloc allocator, void* ud);
 LUA_API void lua_close(lua_State* L);
 LUA_API lua_State* lua_newthread(lua_State* L);

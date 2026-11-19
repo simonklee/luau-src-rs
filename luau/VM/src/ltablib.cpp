@@ -165,7 +165,7 @@ LUAU_NOINLINE static void movebudget(lua_State* L, int srct, int dstt, LuaTable*
 
         // writing nil to an absent key would add a node for it, and a table whose free nodes run out rehashes on each
         // such write without growing, since nil values don't count towards its size
-        if (ttisnil(L->top - 1) && ttisnil(luaH_getnum(dst, t + i)))
+        if (ttisnil(L->top - 1) && ttisnil(luaH_getnum(L, dst, t + i)))
             L->top--;
         else
             lua_rawseti(L, dstt, t + i);
@@ -821,7 +821,7 @@ LUAU_NOINLINE static int findguarded(lua_State* L, LuaTable* t, int init)
 {
     for (int i = init;; ++i)
     {
-        const TValue* e = luaH_getnum(t, i);
+        const TValue* e = luaH_getnum(L, t, i);
         if (ttisnil(e))
             break;
 
@@ -884,7 +884,7 @@ static int tfind(lua_State* L)
         // Fast array search can only be performed when metamethod is absent/not used, as it can mutate table and relocate stack
         if (!iscollectable(L->base + 1) || ttisnil(luaT_gettmbyobj(L, L->base + 1, TM_EQ)))
         {
-            if (int index = luaH_rawfind(t, init, L->base + 1))
+            if (int index = luaH_rawfind(L, t, init, L->base + 1))
                 lua_pushinteger(L, index);
             else
                 lua_pushnil(L);
@@ -902,7 +902,7 @@ static int tfind(lua_State* L)
 
     for (int i = init;; ++i)
     {
-        const TValue* e = luaH_getnum(t, i);
+        const TValue* e = luaH_getnum(L, t, i);
         if (ttisnil(e))
             break;
 

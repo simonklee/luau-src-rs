@@ -144,8 +144,10 @@ static uint64_t siphash13(const uint64_t key[2], const char* str, size_t len)
 // The hash of a string of 32 bytes or more with DFFlag::LuauLongStringHash: SipHash-1-3 under the VM's random key, folded
 // to 32 bits. Without the key, which the VM's code never exposes, nobody can compute it, so colliding strings can't be
 // chosen in advance; and finding them from inside the VM (from table order or timing) gives as few bits as a random
-// function. The hash of a shorter string stays unkeyed (Luau::wordHashShort): the compiler predicts its table slots and
-// native code bakes it in, and the interning table's random salt keeps chosen short keys out of one bucket.
+// function. Without DFFlag::LuauTableKeyedHash the hash of a shorter string stays unkeyed (Luau::wordHashShort): the
+// compiler predicts its table slots and native code bakes it in, and the interning table's random salt keeps chosen
+// short keys out of one bucket. With it, strhash keys that hash too (luaS_keyshort), so that chosen short keys can't share
+// a table's main position either.
 unsigned int luaS_longhash(const uint64_t key[2], const char* str, size_t len)
 {
     uint64_t h = siphash13(key, str, len);
@@ -169,6 +171,18 @@ static void derivekeys(stringtable* tb, const char* data, size_t size)
     uint64_t salt = siphash13(keys[2], data, size);
     tb->saltmult = uint32_t(salt) | 1;
     tb->saltadd = uint32_t(salt >> 32);
+
+    if (tb->keyedtables)
+    {
+        // each key from the seed under its own SipHash domain, so that recovering one tells nothing about the other
+        const uint64_t tablekeys[4][2] = {
+            {4, 0x9e3779b97f4a7c15ull}, {5, 0x9e3779b97f4a7c15ull}, {6, 0x9e3779b97f4a7c15ull}, {7, 0x9e3779b97f4a7c15ull}
+        };
+        tb->tablekey[0] = siphash13(tablekeys[0], data, size);
+        tb->tablekey[1] = siphash13(tablekeys[1], data, size) | 1;
+        tb->shortkey[0] = siphash13(tablekeys[2], data, size);
+        tb->shortkey[1] = siphash13(tablekeys[3], data, size);
+    }
 }
 
 // Fills size bytes (at most 256) from the OS's random source, fresh for every VM, so that VMs made after a fork() differ
@@ -192,11 +206,13 @@ static bool osrandom(char* data, size_t size)
 #endif
 }
 
-// With DFFlag::LuauLongStringHash, gives the VM a random long-string key and a random interning-table salt
+// With DFFlag::LuauLongStringHash, gives the VM a random long-string key and a random interning-table salt, and with
+// DFFlag::LuauTableKeyedHash a random key for its short strings and tables (luaS_keyshort, luaH_keymix)
 void luaS_initlonghash(global_State* g)
 {
     stringtable* tb = &g->strt;
     tb->longhash = tb->wordhash && DFFlag::LuauLongStringHash;
+    tb->keyedtables = tb->longhash && DFFlag::LuauTableKeyedHash;
     if (!tb->longhash)
         return;
 
@@ -297,7 +313,11 @@ static inline unsigned int strhash(const stringtable* tb, const char* str, size_
     if (tb->wordhash)
     {
         if (len < 32)
-            return Luau::wordHashShort(uint32_t(len), str, len);
+        {
+            unsigned int h = Luau::wordHashShort(uint32_t(len), str, len);
+            // With DFFlag::LuauTableKeyedHash the stored hash, and so the string's main position in any table, is keyed
+            return tb->keyedtables ? luaS_keyshort(tb->shortkey, h) : h;
+        }
 
         return tb->longhash ? luaS_longhash(tb->longkey, str, len) : Luau::wordHash(str, len);
     }

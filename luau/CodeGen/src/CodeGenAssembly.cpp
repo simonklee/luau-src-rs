@@ -281,6 +281,7 @@ std::string getAssembly(lua_State* L, int idx, AssemblyOptions options, Lowering
     envInfo.hasPcall = L->global->builtinPcall != nullptr;
     envInfo.hasXpcall = L->global->builtinXpcall != nullptr;
     envInfo.keyedLongStrings = L->global->strt.longhash;
+    envInfo.keyedShortStrings = L->global->strt.keyedtables;
 
     switch (options.target)
     {

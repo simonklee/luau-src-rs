@@ -1577,6 +1577,7 @@ struct VmEnvironmentInfo
     bool hasPcall = false;
     bool hasXpcall = false;
     bool keyedLongStrings = false; // the state hashes strings of 32 bytes or more with its own key (stringtable::longhash)
+    bool keyedShortStrings = false; // and shorter strings too (stringtable::keyedtables, DFFlag::LuauTableKeyedHash)
 };
 
 struct IrFunction

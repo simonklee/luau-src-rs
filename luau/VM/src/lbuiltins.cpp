@@ -980,7 +980,7 @@ static int luauF_rawget(lua_State* L, StkId res, TValue* arg0, int nresults, Stk
 {
     if (nparams >= 2 && nresults <= 1 && ttistable(arg0))
     {
-        setobj2s(L, res, luaH_get(hvalue(arg0), args));
+        setobj2s(L, res, luaH_get(L, hvalue(arg0), args));
         return 1;
     }
 

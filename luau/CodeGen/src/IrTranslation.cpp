@@ -2536,8 +2536,10 @@ bool translateInstNamecall(IrBuilder& build, const Instruction* pc, int pcpos)
     }
 
     // The fast path below bakes in the method name's hash. A state with keyed long strings (DFFlag::LuauLongStringHash)
-    // hashes a name of 32 bytes or more with its own random key, which another state sharing this code doesn't have
-    if (build.function.envInfo.keyedLongStrings && gco2ts(build.function.proto->k[aux].value.gc)->len >= 32)
+    // hashes a name of 32 bytes or more with its own random key, which another state sharing this code doesn't have; with
+    // DFFlag::LuauTableKeyedHash it hashes every name with it
+    if (build.function.envInfo.keyedShortStrings ||
+        (build.function.envInfo.keyedLongStrings && gco2ts(build.function.proto->k[aux].value.gc)->len >= 32))
     {
         if (FFlag::LuauCodegenUserdataDirect)
             return emitNamecallSequence(build, isUdata, pcpos, ra, rb, aux, nparams, nresults);

@@ -667,7 +667,7 @@ static void embeddermarkref(lua_State* L, int ref)
     if (ref <= LUA_REFNIL)
         return;
     LuaTable* wt = hvalue(&L->global->weakregistry);
-    const TValue* slot = luaH_getnum(wt, ref);
+    const TValue* slot = luaH_getnum(L, wt, ref);
     if (iscollectable(slot) && iswhite(gcvalue(slot)))
         reallymarkobject(L->global, gcvalue(slot));
 }

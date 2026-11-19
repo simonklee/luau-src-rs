@@ -178,7 +178,7 @@ void luaV_gettable(lua_State* L, const TValue* t, TValue* key, StkId val)
         { // `t' is a table?
             LuaTable* h = hvalue(t);
 
-            const TValue* res = luaH_get(h, key); // do a primitive get
+            const TValue* res = luaH_get(L, h, key); // do a primitive get
 
             if (res != luaO_nilobject)
                 L->cachedslot = gval2slot(h, res); // remember slot to accelerate future lookups
@@ -200,7 +200,7 @@ void luaV_gettable(lua_State* L, const TValue* t, TValue* key, StkId val)
         else if (LUAU_UNLIKELY(FFlag::DebugLuauUserDefinedClassesRuntime && ttisobject(t)))
         {
             LuauObject* inst = objectvalue(t);
-            const TValue* offsettval = luaH_get(inst->lclass->memberstooffset, key);
+            const TValue* offsettval = luaH_get(L, inst->lclass->memberstooffset, key);
 
             // Class instances throw if you try to access a member that is not
             // present.
@@ -214,7 +214,7 @@ void luaV_gettable(lua_State* L, const TValue* t, TValue* key, StkId val)
         else if (LUAU_UNLIKELY(FFlag::DebugLuauUserDefinedClassesRuntime && ttisclass(t)))
         {
             LuauClass* lco = classvalue(t);
-            const TValue* res = luaH_get(lco->memberstooffset, key);
+            const TValue* res = luaH_get(L, lco->memberstooffset, key);
 
             // Class objects throw if you try to access a member that is not
             // present.
@@ -263,7 +263,7 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
         { // `t' is a table?
             LuaTable* h = hvalue(t);
 
-            const TValue* oldval = luaH_get(h, key);
+            const TValue* oldval = luaH_get(L, h, key);
 
             // should we assign the key? (if key is valid or __newindex is not set)
             if (!ttisnil(oldval) || (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL)
@@ -286,7 +286,7 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
         else if (LUAU_UNLIKELY(FFlag::DebugLuauUserDefinedClassesRuntime && ttisobject(t)))
         {
             LuauObject* inst = objectvalue(t);
-            const TValue* offset = luaH_get(inst->lclass->memberstooffset, key);
+            const TValue* offset = luaH_get(L, inst->lclass->memberstooffset, key);
             if (ttisnil(offset))
                 luaG_missingmembererror(L, t, key);
             const uint32_t offsetnum = uint32_t(nvalue(offset));

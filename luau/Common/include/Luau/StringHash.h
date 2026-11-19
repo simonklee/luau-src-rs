@@ -20,6 +20,10 @@ LUAU_DYNAMIC_FASTFLAG(LuauShortStringHash)
 // its own key (luaS_longhash), which the compiler can't know: its predicted slots for such strings miss once.
 LUAU_DYNAMIC_FASTFLAG(LuauLongStringHash)
 
+// With DFFlag::LuauTableKeyedHash (and the two above), each VM also keys its shorter strings' hashes and its tables' main
+// positions (VM/src/ltable.cpp): the compiler's predicted slots for every string miss once.
+LUAU_DYNAMIC_FASTFLAG(LuauTableKeyedHash)
+
 namespace Luau
 {
 
@@ -38,7 +42,7 @@ inline uint32_t loadLe32(const char* p)
 // compiler computes predicts its slot
 inline bool isStringHashKeyed(size_t len)
 {
-    return DFFlag::LuauShortStringHash && DFFlag::LuauLongStringHash && len >= 32;
+    return DFFlag::LuauShortStringHash && DFFlag::LuauLongStringHash && (len >= 32 || DFFlag::LuauTableKeyedHash);
 }
 
 // Hashes up to 31 bytes 4 at a time into a 64-bit state. Each step takes 32 bits, spread over the state by a
