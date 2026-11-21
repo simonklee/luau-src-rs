@@ -35,8 +35,6 @@
 
 #include <string.h>
 
-LUAU_DYNAMIC_FASTFLAG(LuauTableFindImprovement)
-
 // Set this to 1 to change the hash function to something different (and possibly trivial). Useful
 // for checking if a Lua program's behavior depends on the hash function.
 #define ALT_HASH_FUNCTION (0)
@@ -282,55 +280,6 @@ template<>
 LUAU_FORCEINLINE LuaNode* mainpositiontagged<LUA_TGCO>(const LuaTable* t, GCObject* key, const lua_State* L)
 {
     return hashpointer(t, key, L);
-}
-
-// TODO: remove with FFlagLuauTableFindImprovement
-// For static luaO_rawequalKey dispatch on a known tag (or GCO). Only used specializations are implemented
-template<int Tag, typename T>
-static LUAU_FORCEINLINE int rawequalkeyvalue(const TKey* t1, T key) = delete;
-
-template<>
-LUAU_FORCEINLINE int rawequalkeyvalue<LUA_TBOOLEAN>(const TKey* t1, int key)
-{
-    return bvalue(t1) == key;
-}
-
-template<>
-LUAU_FORCEINLINE int rawequalkeyvalue<LUA_TNUMBER>(const TKey* t1, double key)
-{
-    return luai_numeq(nvalue(t1), key);
-}
-
-template<>
-LUAU_FORCEINLINE int rawequalkeyvalue<LUA_TVECTOR>(const TKey* t1, const LUA_VECTOR_TYPE* key)
-{
-    return luai_veceq(vvalue(t1), key);
-}
-
-template<>
-LUAU_FORCEINLINE int rawequalkeyvalue<LUA_TGCO>(const TKey* t1, GCObject* key)
-{
-    return gcvalue(t1) == key;
-}
-
-// Lookup a node in the main position of the key or look through the node chain
-template<int Tag, typename T>
-static LUAU_FORCEINLINE const TValue* chainsearchtagged_DEPRECATED(const LuaTable* t, T key, int keytag, const lua_State* L)
-{
-    LuaNode* n = mainpositiontagged<Tag>(t, key, L);
-
-    // check whether `key' is somewhere in the chain
-    for (;;)
-    {
-        if (ttype(gkey(n)) == keytag && rawequalkeyvalue<Tag>(gkey(n), key))
-            return gval(n);
-
-        if (gnext(n) == 0)
-            break;
-        n += gnext(n);
-    }
-
-    return luaO_nilobject;
 }
 
 // For static raw equality dispatch on a known tag
@@ -1205,61 +1154,30 @@ const TValue* luaH_getp(LuaTable* t, void* key, int tag, lua_State* L)
 */
 const TValue* luaH_get(LuaTable* t, const TValue* key, lua_State* L)
 {
-    if (DFFlag::LuauTableFindImprovement)
+    switch (ttype(key))
     {
-        switch (ttype(key))
-        {
-        case LUA_TNIL:
-            return luaO_nilobject;
-        case LUA_TBOOLEAN:
-            return chainsearchtagged<LUA_TBOOLEAN>(t, bvalue(key), LUA_TBOOLEAN, L);
-        case LUA_TLIGHTUSERDATA:
-            return luaH_getp(t, pvalue(key), lightuserdatatag(key), L); // special search function with tag comparison
-        case LUA_TNUMBER:
-        {
-            int k;
-            double n = nvalue(key);
-            luai_num2int(k, n);
-            if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
-                return luaH_getnum(t, k, L);          // use specialized version
+    case LUA_TNIL:
+        return luaO_nilobject;
+    case LUA_TBOOLEAN:
+        return chainsearchtagged<LUA_TBOOLEAN>(t, bvalue(key), LUA_TBOOLEAN, L);
+    case LUA_TLIGHTUSERDATA:
+        return luaH_getp(t, pvalue(key), lightuserdatatag(key), L); // special search function with tag comparison
+    case LUA_TNUMBER:
+    {
+        int k;
+        double n = nvalue(key);
+        luai_num2int(k, n);
+        if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
+            return luaH_getnum(t, k, L);          // use specialized version
 
-            return chainsearchtagged<LUA_TNUMBER>(t, nvalue(key), LUA_TNUMBER, L);
-        }
-        case LUA_TVECTOR:
-            return chainsearchtagged<LUA_TVECTOR>(t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR, L);
-        case LUA_TSTRING:
-            return luaH_getstr(t, tsvalue(key));
-        default:
-            return chainsearchtagged<LUA_TGCO>(t, gcvalue(key), ttype(key), L);
-        }
+        return chainsearchtagged<LUA_TNUMBER>(t, nvalue(key), LUA_TNUMBER, L);
     }
-    else
-    {
-        switch (ttype(key))
-        {
-        case LUA_TNIL:
-            return luaO_nilobject;
-        case LUA_TBOOLEAN:
-            return chainsearchtagged_DEPRECATED<LUA_TBOOLEAN>(t, bvalue(key), LUA_TBOOLEAN, L);
-        case LUA_TLIGHTUSERDATA:
-            return luaH_getp(t, pvalue(key), lightuserdatatag(key), L); // special search function with tag comparison
-        case LUA_TNUMBER:
-        {
-            int k;
-            double n = nvalue(key);
-            luai_num2int(k, n);
-            if (luai_numeq(cast_num(k), nvalue(key))) // index is int?
-                return luaH_getnum(t, k, L);          // use specialized version
-
-            return chainsearchtagged_DEPRECATED<LUA_TNUMBER>(t, nvalue(key), LUA_TNUMBER, L);
-        }
-        case LUA_TVECTOR:
-            return chainsearchtagged_DEPRECATED<LUA_TVECTOR>(t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR, L);
-        case LUA_TSTRING:
-            return luaH_getstr(t, tsvalue(key));
-        default:
-            return chainsearchtagged_DEPRECATED<LUA_TGCO>(t, gcvalue(key), ttype(key), L);
-        }
+    case LUA_TVECTOR:
+        return chainsearchtagged<LUA_TVECTOR>(t, (const LUA_VECTOR_TYPE*)vvalue(key), LUA_TVECTOR, L);
+    case LUA_TSTRING:
+        return luaH_getstr(t, tsvalue(key));
+    default:
+        return chainsearchtagged<LUA_TGCO>(t, gcvalue(key), ttype(key), L);
     }
 }
 
